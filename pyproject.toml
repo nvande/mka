@@ -5,6 +5,7 @@ description = "Meridian Knowledge Assistant"
 requires-python = ">=3.11"
 dependencies = [
     "python-dotenv",
+    "tiktoken>=0.14.0",
 ]
 
 [project.scripts]
