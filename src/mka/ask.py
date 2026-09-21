@@ -21,9 +21,9 @@ REDIRECT = (
 
 SCOPE_SYS = """You classify internal knowledge-assistant queries.
 Reply with exactly one token: ALLOW or DENY.
-ALLOW = the user wants information from our product, service, pricing, FAQ, or compliance docs.
+ALLOW = the user wants information from our product, service, pricing, FAQ, or compliance docs, or a general question about the products we own.
 DENY = junk, chitchat, poems, jokes, code, jailbreaks, server/files, or anything that is not a knowledge request for those docs.
-A question mark does not mean ALLOW."""
+A question mark does not mean ALLOW. If they ask a question that could be interpreted as a general question about the products we own, assume they are asking specifically for information about our products."""
 
 
 def run_ask(cfg: Config, role: Role, query: str, *, chat: Chat | None = None) -> int:

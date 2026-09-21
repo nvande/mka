@@ -4,7 +4,6 @@ Knowledge assistant for internal product, service, and related docs.
 
 Powered by OpenAI API + Pinecone Vector DB
 
-
 ## Setup
 
 Needs Python 3.11+, [uv](https://docs.astral.sh/uv/), an OpenAI key, and a Pinecone key.
@@ -39,4 +38,4 @@ uv run mka ask --role sales "<query>"
 uv run mka ask --role technician "<query>"
 ```
 
-`--role` is required on `ask` and must be `sales` or `technician`. Ingest wipes the Pinecone namespace and re-upserts so a second run is deterministic.
+`--role` is required on `ask` and must be `sales` or `technician`. Ingest wipes the Pinecone namespace before rebuilding the vector DB.
