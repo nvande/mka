@@ -1,0 +1,27 @@
+{
+  "documents": [
+    {
+      "doc_id": "spec_current",
+      "path": "docs/spec_current.md",
+      "title": "Current Spec",
+      "doc_type": "spec",
+      "audience": "all",
+      "model": "MD-7000",
+      "last_updated": "2025-01-10",
+      "version": "2025-01",
+      "flagged_outdated": false,
+      "notes": "extra field must be ignored"
+    },
+    {
+      "doc_id": "spec_legacy",
+      "path": "docs/spec_legacy.md",
+      "title": "Legacy Spec",
+      "doc_type": "spec",
+      "audience": "all",
+      "model": "MD-7000",
+      "last_updated": "2021-03-01",
+      "version": "2021-03",
+      "flagged_outdated": true
+    }
+  ]
+}
