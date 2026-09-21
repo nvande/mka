@@ -312,8 +312,34 @@ def test_run_ask_decide_refuse_prints_missing_info(tmp_path, capsys) -> None:
     assert "role" not in payload
 
 
-def test_run_ask_decide_refuse_prints_ambiguous(tmp_path, capsys) -> None:
-    hit = make_hit()
+def test_run_ask_ambiguous_capacity_without_model(tmp_path, capsys) -> None:
+    # Same asked slot, three live specs, three different numbers. Not missing.
+    hits = [
+        make_hit(
+            id="spec_md5000::0",
+            title="MD-5000 Specification",
+            path="docs/spec_md5000.md",
+            doc_id="spec_md5000",
+            model="MD-5000",
+            text="Rated lifting capacity: 30,000 lbs",
+        ),
+        make_hit(
+            id="spec_md7000::0",
+            title="MD-7000 Specification",
+            path="docs/spec_md7000.md",
+            doc_id="spec_md7000",
+            model="MD-7000",
+            text="Rated lifting capacity: 35,000 lbs",
+        ),
+        make_hit(
+            id="spec_md9000::0",
+            title="MD-9000 Specification",
+            path="docs/spec_md9000.md",
+            doc_id="spec_md9000",
+            model="MD-9000",
+            text="Rated lifting capacity: 40,000 lbs",
+        ),
+    ]
     chat = ScriptedChat(
         {
             SCOPE_SYS: "ALLOW",
@@ -321,12 +347,13 @@ def test_run_ask_decide_refuse_prints_ambiguous(tmp_path, capsys) -> None:
             REFUSE_SYS: refuse_json("AMBIGUOUS", "which dock leveler model"),
         }
     )
+    query = "What is the rated lifting capacity of the dock leveler?"
     code = run_ask(
         make_config(tmp_path),
         "sales",
-        "What is the cheapest dock leveler?",
+        query,
         chat=chat,
-        retriever=lambda query, role: [hit],
+        retriever=lambda q, role: hits,
     )
     out = capsys.readouterr().out
     assert code == 0
@@ -335,6 +362,59 @@ def test_run_ask_decide_refuse_prints_ambiguous(tmp_path, capsys) -> None:
         "Please clarify which dock leveler model in your question and ask again."
     ) in out
     assert "Related:" in out
+    assert "- MD-5000 Specification (docs/spec_md5000.md)" in out
+    assert "- MD-7000 Specification (docs/spec_md7000.md)" in out
+    assert "- MD-9000 Specification (docs/spec_md9000.md)" in out
+    payload = json.loads(chat.calls[2][1])
+    assert payload["query"] == query
+    assert [chunk["id"] for chunk in payload["chunks"]] == [
+        "spec_md5000::0",
+        "spec_md7000::0",
+        "spec_md9000::0",
+    ]
+
+
+def test_run_ask_ambiguous_md7000_price_without_config(tmp_path, capsys) -> None:
+    # Q5 is answerable only with size and voltage; this query names neither.
+    hit = make_hit(
+        id="pricing_md7000_2026::0",
+        title="MD-7000 Pricing — 2026",
+        path="docs/pricing_md7000_2026.md",
+        doc_id="pricing_md7000_2026",
+        model="MD-7000",
+        doc_type="pricing",
+        text=(
+            "MD-7000, 6 ft × 8 ft, 230V 3-phase: $8,450. "
+            "MD-7000, 7 ft × 8 ft, 230V 3-phase: $9,100. "
+            "MD-7000, 7 ft × 10 ft, 230V 3-phase: $10,200. "
+            "Voltage upgrade to 460V: +$350."
+        ),
+    )
+    chat = ScriptedChat(
+        {
+            SCOPE_SYS: "ALLOW",
+            DECIDE_SYS: "REFUSE",
+            REFUSE_SYS: refuse_json(
+                "AMBIGUOUS", "which MD-7000 platform size and voltage"
+            ),
+        }
+    )
+    code = run_ask(
+        make_config(tmp_path),
+        "sales",
+        "What is the list price for an MD-7000?",
+        chat=chat,
+        retriever=lambda query, role: [hit],
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert (
+        "The question was too ambiguous to answer. "
+        "Please clarify which MD-7000 platform size and voltage "
+        "in your question and ask again."
+    ) in out
+    assert "Related:" in out
+    assert "$8,450" not in out.split("Related:")[0]
 
 
 def test_run_ask_decide_refuse_unknown_keeps_canned_line(tmp_path, capsys) -> None:
