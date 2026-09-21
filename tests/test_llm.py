@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mka.llm import OpenAIEmbeddings, make_chat, make_embeddings
+from mka.llm import OpenAIChat, OpenAIEmbeddings, make_chat, make_embeddings
 
 from conftest import make_config
 
@@ -49,3 +49,25 @@ def test_embeddings_empty() -> None:
     embedder = OpenAIEmbeddings(client, "text-embedding-3-small")
     assert embedder.embed([]) == []
     assert api.batch_sizes == []
+
+
+def test_chat_json_object_sets_response_format() -> None:
+    captured: dict = {}
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))
+                ]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+    chat = OpenAIChat(client, "gpt-5.4-nano")
+    assert chat.complete(system="s", user="u", json_object=True) == '{"ok": true}'
+    assert captured["response_format"] == {"type": "json_object"}
+    assert captured["temperature"] == 0
+    captured.clear()
+    chat.complete(system="s", user="u")
+    assert "response_format" not in captured

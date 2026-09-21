@@ -10,7 +10,7 @@ EMBED_BATCH = 64
 
 
 class Chat(Protocol):
-    def complete(self, *, system: str, user: str) -> str: ...
+    def complete(self, *, system: str, user: str, json_object: bool = False) -> str: ...
 
 
 class Embeddings(Protocol):
@@ -22,7 +22,10 @@ class OpenAIChat:
         self._client = client
         self._model = model
 
-    def complete(self, *, system: str, user: str) -> str:
+    def complete(self, *, system: str, user: str, json_object: bool = False) -> str:
+        kwargs: dict = {}
+        if json_object:
+            kwargs["response_format"] = {"type": "json_object"}
         response = self._client.chat.completions.create(
             model=self._model,
             temperature=0,
@@ -30,6 +33,7 @@ class OpenAIChat:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            **kwargs,
         )
         content = response.choices[0].message.content
         return (content or "").strip()
