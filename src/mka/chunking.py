@@ -83,6 +83,8 @@ def _metadata(row: ManifestRow, text: str) -> dict:
         "last_updated": row.last_updated,
         "flagged_outdated": row.flagged_outdated,
         "contains_pricing": contains_pricing(text),
+        "contains_warning": False,
+        "warning_text": "",
         "text": text,
     }
 

@@ -38,6 +38,8 @@ class Hit:
     doc_id: str
     model: str
     doc_type: str
+    contains_warning: bool
+    warning_text: str
 
 
 def load_manifest(corpus_dir: Path) -> list[ManifestRow]:

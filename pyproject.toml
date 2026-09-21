@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Meridian Knowledge Assistant"
 requires-python = ">=3.11"
 dependencies = [
+    "openai>=3.16.2",
+    "pinecone>=5",
     "python-dotenv",
     "tiktoken>=0.14.0",
 ]

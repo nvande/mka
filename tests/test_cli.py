@@ -20,18 +20,39 @@ def test_ask_rejects_unknown_role() -> None:
     assert exc.value.code == 2
 
 
-def test_ingest_is_stub(capsys: object) -> None:
+def test_ingest_via_cli(
+    fixture_corpus: Path, monkeypatch: pytest.MonkeyPatch, capsys: object
+) -> None:
+    monkeypatch.setenv("CORPUS_DIR", str(fixture_corpus))
+    monkeypatch.setattr("mka.ingest._write_index", lambda cfg, chunks: None)
     with pytest.raises(SystemExit) as exc:
         main(["ingest"])
-    assert exc.value.code == 1
-    assert "ingest is not implemented yet" in capsys.readouterr().err
+    assert exc.value.code == 0
+    assert "chunks: 2" in capsys.readouterr().out
 
 
-def test_ask_is_stub(capsys: object) -> None:
+def test_ask_empty_via_cli(capsys: object) -> None:
     with pytest.raises(SystemExit) as exc:
-        main(["ask", "--role", "sales", "capacity?"])
-    assert exc.value.code == 1
-    assert "ask is not implemented yet" in capsys.readouterr().err
+        main(["ask", "--role", "sales", "   "])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "Meridian Knowledge Assistant" in out
+    assert "Ask a question about Meridian products" in out
+
+
+def test_ask_redirect_via_cli(monkeypatch: pytest.MonkeyPatch, capsys: object) -> None:
+    class DenyChat:
+        def complete(self, *, system: str, user: str) -> str:
+            del system, user
+            return "DENY"
+
+    monkeypatch.setattr("mka.ask.make_chat", lambda cfg: DenyChat())
+    with pytest.raises(SystemExit) as exc:
+        main(["ask", "--role", "sales", "Tell me a joke"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "Meridian Knowledge Assistant" in out
+    assert "I can only answer questions from Meridian internal" in out
 
 
 def test_scan_via_cli(fixture_corpus: Path, monkeypatch: pytest.MonkeyPatch, capsys: object) -> None:
