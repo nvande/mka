@@ -9,10 +9,10 @@ from mka.config import Config
 FIXTURE_CORPUS = Path(__file__).parent / "fixtures" / "corpus"
 
 
-def make_config(corpus_dir: Path) -> Config:
+def make_config(corpus_dir: Path, pinecone_api_key: str = "") -> Config:
     return Config(
         corpus_dir=corpus_dir,
-        pinecone_api_key="",
+        pinecone_api_key=pinecone_api_key,
         pinecone_index="mka-poc",
         pinecone_cloud="aws",
         pinecone_region="us-east-1",

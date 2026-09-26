@@ -23,7 +23,7 @@ corpus/
   docs/*.md
 ```
 
-`mka scan` only needs the corpus. `mka ingest` and in-scope `mka ask` need the API keys.
+`mka ingest`, `mka clear`, and in-scope `mka ask` need the API keys.
 
 ```sh
 uv run pytest
@@ -32,10 +32,17 @@ uv run pytest
 ## Run
 
 ```sh
+uv run mka clear
 uv run mka ingest
-uv run mka scan
-uv run mka ask --role sales "<query>"
-uv run mka ask --role technician "<query>"
+uv run mka ask -s "<query>"
+uv run mka ask -t "<query>"
+uv run mka eval
 ```
 
-`--role` is required on `ask` and must be `sales` or `technician`. Ingest wipes the Pinecone namespace before rebuilding the vector DB.
+`mka eval` runs every question in `corpus/questions.json` as both roles and prints PASS/FAIL per case. A case passes when the expected sources are cited (minus documents that role cannot see), the must-contain strings appear, and the must-not-contain strings do not. The string checks live in `src/mka/eval.py`. Exit code is 1 if any case fails.
+
+Ask needs a role: `-s` / `--sales` / `--role sales`, or `-t` / `--technician` / `--role technician`. `mka clear` deletes the Pinecone index and Python caches (`__pycache__`, `.pyc`, `.pytest_cache`). It does not touch `corpus/` or `.env`. Ingest recreates the index and wipes the namespace before rebuilding. If a current document conflicts with a `flagged_outdated` revision, the answer uses the current value and notes the old conflict. If two current documents disagree, the answer names both values and does not pick a winner.
+
+## Write-up
+
+Screening Part 3 (production, evaluation, extensibility) is in [writeup.md](writeup.md).

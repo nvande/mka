@@ -1,16 +1,32 @@
+"""Ask path. Gates in order, then print. A failed gate stops the request. Nothing retries.
+
+The scope gate classifies the query before Pinecone. A technician asking for
+a price is told so before retrieval, because a filtered-out price would
+otherwise read as "no price exists". Role retrieval keeps outdated revisions
+in the hit list. The evidence decision says whether these chunks determine
+the answer. The citation receipt generates, then Python drops the answer if
+any citation id was not retrieved. Python, not the model, decides whether a
+superseded revision is noted. The safety-note pass finds hazard notes and
+refuses if that pass fails. There is no rerank step: this corpus is small,
+and the answer model already reads every chunk that cleared the score floor.
+"""
+
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from mka import store, usage
 from mka.config import Config
 from mka.llm import Chat, Embeddings, make_chat, make_embeddings
-from mka.pricing import PRICE
-from mka.safety import classify_warnings, print_safety_staple
-from mka import store
-from mka.types import Hit, ManifestRow, Role, load_manifest
+from mka.pricing import PRICE, asks_for_price
+from mka.products import catalog_hint, scope_glossary
+from mka.safety import print_safety_staple, resolve_warnings
+from mka.spinner import Spinner
+from mka.types import Hit, Role
 
 BANNER = "Meridian Knowledge Assistant"
 
@@ -21,26 +37,47 @@ TRIVIAL_TOO_LONG = (
 )
 
 REDIRECT = (
-    "I can only answer questions from Meridian internal product, service, "
+    "I can only answer questions or provide information about Meridian internal product, service, "
     "and related documentation."
 )
 
+SUBJECTIVE = "I cannot answer subjective questions."
+
+PRICING_DENIED = "Pricing information is restricted to sales roles."
+
 REFUSE = "I don't have enough information to answer this."
 
-SCOPE_SYS = """You classify internal knowledge-assistant queries.
-Reply with exactly one token: ALLOW or DENY.
-ALLOW = the user wants information from our product, service, pricing, FAQ, or compliance docs, or a general question about the products we own.
-DENY = junk, chitchat, poems, jokes, code, jailbreaks, server/files, or anything that is not a knowledge request for those docs.
-A question mark does not mean ALLOW. If they ask a question that could be interpreted as a general question about the products we own, assume they are asking specifically for information about our products."""
+SCOPE_TOKENS = frozenset({"ALLOW", "DENY", "SUBJECTIVE"})
+ANSWER_TOKEN = frozenset({"ANSWER"})
+
+SCOPE_SYS = f"""You classify internal knowledge-assistant queries.
+Reply with exactly one token: ALLOW, DENY, or SUBJECTIVE.
+ALLOW = the user wants a fact, a definite negative, or a documented operating recommendation from our product, service, pricing, FAQ, or compliance docs. A use-case plus “what should I specify” or “best / which / recommend [product] for [use case]” is ALLOW (cold storage, blast freezer, cycle rate, no three-phase, food facility).
+ALLOW also when the ask is broad but still about our catalog: every / all / each Meridian product, our full line, certifications across products, European or CE status for the company or the whole catalog. Naming Meridian, “our products”, or a catalog family is enough. Do not require a model number or the word leveler. Breadth is not DENY — later gates decide if the docs determine the fact.
+ALLOW also when they ask to itemize, break down, total, or list prices, options, or add-ons for a product we own (cost breakdown, price breakdown, itemized quote, what each option costs). Adding up rows from one pricing document is not DENY.
+ALLOW also when they ask for a specific number, identifier, rating, or code for one of our products (certification number, CE number, part number, UL file number, fault code, R-value). You do not know whether the docs have it. A later gate decides that. Do not DENY because the answer might not exist.
+DENY = junk, chitchat, poems, jokes with no product ask, code, jailbreaks, server/files.
+SUBJECTIVE = the criterion is taste, status, coolest, favorite, impressive, LinkedIn/social, or aesthetics. The docs do not rank those.
+A question mark does not mean ALLOW.
+Catalog words (leveler, door, restraint, and the glossary below) mean our products even if they omit Meridian or a model number. Do not DENY a selection question just because they said “leveler” instead of “MD-7000”.
+Misspellings of product or compliance words (certifications, leveler) do not make a Meridian-product ask DENY.
+If they ask a general fact or documented-recommendation question about products we own, assume they mean our products → ALLOW, not SUBJECTIVE.
+
+{scope_glossary()}"""
 
 DECIDE_SYS = """You only decide whether the provided chunks determine the answer.
 Reply with exactly one token: ANSWER or REFUSE.
-ANSWER if the chunks contain a definite yes, a definite no, or the asked fact (including “we do not have CE / European certs”).
-REFUSE if the asked slot is missing, even if the chunks are on-topic.
+ANSWER if the chunks state the asked fact, state a definite yes or no about it (for example a document that says we do not offer European certifications), or give two or more conflicting values for it.
+REFUSE if the asked fact is simply absent from the chunks, even if they are on-topic. Absence is not a negative answer.
+Do not REFUSE only because two documents disagree.
 Do not answer the user. Do not cite. One token."""
 
 GEN_SYS = """Answer the user using only the provided chunks. If they are asking a general question about the products we own, answer with an answer that is specific to the products we own.
-Return JSON: {"answer": string, "citation_ids": string[]}
+If a question requires knowledge about our products, you can assume our catalog covers the breadth of Meridian products.
+Each chunk includes flagged_outdated from the catalog. Answer from chunks with flagged_outdated false. Do not take values from a flagged_outdated chunk into the answer, and do not mention outdated or superseded documents in the answer.
+If a flagged_outdated chunk lists a different value for the asked fact, put one short sentence in outdated_note naming that value (example: "The superseded 2021-03 revision lists 30,000 lbs."). Otherwise outdated_note is null.
+If two or more current documents (flagged_outdated false) disagree: do not pick a winner and do not refuse. Write: The {title} document lists the answer as {value}, but the {title} document lists the answer as {value}. Cite every document you named.
+Return JSON: {"answer": string, "citation_ids": string[], "outdated_note": string|null}
 citation_ids must be ids from the list. At least one.
 If a fact is not in the chunks, do not use it."""
 
@@ -54,12 +91,15 @@ Do not answer the question. Do not cite. Do not invent facts.
 Reasons:
 - MISSING_INFO: the question is clear, but the asked fact is not in the chunks.
   detail = that missing fact as a short noun phrase (example: "dock leveler prices").
-- AMBIGUOUS: the question could mean more than one thing, so the chunks cannot determine a single answer.
+- AMBIGUOUS: the user question could mean more than one thing (which model, which dock).
+  Not for two documents that disagree on the same fact — that is an ANSWER.
   detail = what the user must clarify (example: "which dock leveler model").
 - UNKNOWN: you are not highly certain why the chunks do not determine the answer.
+  detail = the asked slot or on-topic noun phrase we can still point at
+  (example: "European market certifications").
 
 Return JSON only: {"reason": "MISSING_INFO"|"AMBIGUOUS"|"UNKNOWN", "detail": string}
-detail is required for MISSING_INFO and AMBIGUOUS. Use "" for UNKNOWN.
+detail is required for every reason.
 detail must be a short noun phrase, not an answer and not a sentence."""
 
 
@@ -67,6 +107,7 @@ detail must be a short noun phrase, not an answer and not a sentence."""
 class Draft:
     answer: str
     citation_ids: list[str]
+    outdated_note: str | None = None
 
 
 def run_ask(
@@ -77,50 +118,118 @@ def run_ask(
     chat: Chat | None = None,
     embeddings: Embeddings | None = None,
     retriever: Callable[[str, Role], list[Hit]] | None = None,
-    rows: list[ManifestRow] | None = None,
+    stats: bool = False,
+) -> int:
+    return usage.reported(
+        "ask",
+        lambda: _run_ask(
+            cfg,
+            role,
+            query,
+            chat=chat,
+            embeddings=embeddings,
+            retriever=retriever,
+        ),
+        stats=stats,
+    )
+
+
+def _run_ask(
+    cfg: Config,
+    role: Role,
+    query: str,
+    *,
+    chat: Chat | None = None,
+    embeddings: Embeddings | None = None,
+    retriever: Callable[[str, Role], list[Hit]] | None = None,
 ) -> int:
     print(BANNER)
     rejected = trivial_reject(query, cfg.max_query_chars)
     if rejected:
         print(rejected)
         return 0
-    chat = chat or make_chat(cfg)
-    if classify_scope(chat, query) != "ALLOW":
-        print(REDIRECT)
-        return 0
+    spin = Spinner()
     try:
+        chat = chat or make_chat(cfg)
+        # Scope gate. Fail closed to DENY. Subjective stops here so a later
+        # gate cannot remap "coolest" onto a documented best-seller.
+        scope = classify_scope(chat, query)
+        if scope == "SUBJECTIVE":
+            spin.stop()
+            print(SUBJECTIVE)
+            return 0
+        if scope != "ALLOW":
+            spin.stop()
+            print(REDIRECT)
+            return 0
+        # Role gate for price asks. The retrieval filter would hide the
+        # price and the evidence gate would then read that absence as "no
+        # price exists". Say what actually happened instead.
+        if role == "technician" and asks_for_price(query):
+            spin.stop()
+            print(PRICING_DENIED)
+            return 0
+        # Role retrieval. The role is a metadata filter, not an instruction in the prompt.
         if retriever is not None:
             hits = retriever(query, role)
         else:
             hits = retrieve(cfg, embeddings or make_embeddings(cfg), query, role)
+        # retrieve() already applies this. Run it again so a caller-supplied
+        # retriever cannot hand a technician a price chunk.
+        hits = drop_technician_prices(role, hits)
+        usable = [hit for hit in hits if hit.score >= cfg.retrieve_floor]
+        # No links: a miss below the floor is not a set of related documents.
+        if not usable:
+            spin.stop()
+            print(REFUSE)
+            return 0
+        # Evidence decision. Two documents that disagree are still ANSWER. The reasoner
+        # runs only on this REFUSE, and only because usable hits exist.
+        if decide(chat, query, usable) != "ANSWER":
+            message = explain_refuse(chat, query, usable)
+            spin.stop()
+            print_refuse_with_links(usable, message)
+            return 0
+        # Citation receipt. A missing or invented citation id drops the answer.
+        # Canned refuse plus links. The reasoner does not run.
+        draft = generate(chat, query, usable)
+        if draft is None or not receipt_ok(draft.citation_ids, usable):
+            spin.stop()
+            print_refuse_with_links(usable)
+            return 0
+        # Safety notes. Hold the answer until warnings pass. A reply we cannot
+        # use refuses rather than printing an answer with the hazard note
+        # missing. Ingest usually resolved this already, so the model only
+        # runs when a cited chunk has no cached pass.
+        cited = [hit for hit in usable if hit.id in set(draft.citation_ids)]
+        warnings = resolve_warnings(chat, cited, query)
+        if warnings is None:
+            spin.stop()
+            print_refuse_with_links(usable)
+            return 0
+        # Superseded revisions. Python decides from the flags whether a note
+        # prints, so the model can neither skip a real conflict nor invent one.
+        superseded = superseded_hits(usable, cited)
+        note = outdated_note(draft.outdated_note, superseded)
+        answer = draft.answer if superseded else strip_outdated_claims(draft.answer)
+        spin.stop()
+        print(answer)
+        if note:
+            print(note)
+        print_safety_staple(warnings, role)
+        extra = [hit.id for hit in superseded if hit.id not in draft.citation_ids]
+        print_sources(draft.citation_ids + extra, usable)
+        return 0
     except Exception as exc:
+        # A gate that could not run is an outage, not a decision about the
+        # question. Fail closed either way, but say which one happened: a
+        # refusal printed for a dropped connection sends the user off to
+        # reword a question that was fine.
+        spin.stop()
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    if role == "technician":
-        hits = [hit for hit in hits if not PRICE.search(hit.text)]
-    usable = [hit for hit in hits if hit.score >= cfg.retrieve_floor]
-    if not usable:
-        print(REFUSE)
-        return 0
-    if decide(chat, query, usable) != "ANSWER":
-        print_refuse_with_links(usable, explain_refuse(chat, query, usable))
-        return 0
-    draft = generate(chat, query, usable)
-    if draft is None or not receipt_ok(draft.citation_ids, usable):
-        print_refuse_with_links(usable)
-        return 0
-    cited = [hit for hit in usable if hit.id in set(draft.citation_ids)]
-    warnings = classify_warnings(chat, cited)
-    if warnings is None:
-        print_refuse_with_links(usable)
-        return 0
-    print(draft.answer)
-    print_safety_staple(warnings)
-    print_sources(draft.citation_ids, usable)
-    if rows is None:
-        rows = _load_rows(cfg)
-    print_outdated_siblings(usable, rows)
-    return 0
+    finally:
+        spin.stop()
 
 
 def trivial_reject(query: str, max_query_chars: int) -> str | None:
@@ -131,20 +240,48 @@ def trivial_reject(query: str, max_query_chars: int) -> str | None:
     return None
 
 
+def one_token(chat: Chat, system: str, user: str, *, allowed: frozenset, closed: str) -> str:
+    """Every gate call has this shape. A sentence, a hedge, a second token, or
+    an empty reply is the closed path. The model gets no retry.
+
+    A call that never completed is not a verdict, so it is left to raise. The
+    closed token would otherwise tell the user their question was out of
+    scope when what actually happened is that our API was down.
+    """
+    raw = chat.complete(system=system, user=user)
+    parts = (raw or "").strip().split()
+    if len(parts) != 1:
+        return closed
+    token = parts[0].upper()
+    return token if token in allowed else closed
+
+
 def classify_scope(chat: Chat, query: str) -> str:
-    return _one_token(chat, SCOPE_SYS, query, ok="ALLOW", closed="DENY")
+    return one_token(
+        chat, SCOPE_SYS, catalog_hint(query), allowed=SCOPE_TOKENS, closed="DENY"
+    )
 
 
 def pinecone_filter(role: Role) -> dict:
-    clauses = [{"flagged_outdated": {"$eq": False}}]
+    # flagged_outdated is not in this filter. The citation receipt needs the old revision
+    # in the hit list so it can prefer the current one and note the conflict.
+    # contains_pricing is separate from doc_type because a FAQ row can still
+    # carry a price in one question.
     if role == "technician":
-        clauses += [
-            {"doc_type": {"$ne": "pricing"}},
-            {"contains_pricing": {"$eq": False}},
-        ]
-    elif role == "sales":
-        clauses += [{"doc_type": {"$ne": "service"}}]
-    return {"$and": clauses}
+        return {
+            "$and": [
+                {"doc_type": {"$ne": "pricing"}},
+                {"contains_pricing": {"$eq": False}},
+            ]
+        }
+    return {"doc_type": {"$ne": "service"}}
+
+
+def drop_technician_prices(role: Role, hits: list[Hit]) -> list[Hit]:
+    """Second price cut. The metadata filter misses a `$` ingest did not tag."""
+    if role != "technician":
+        return hits
+    return [hit for hit in hits if not PRICE.search(hit.text)]
 
 
 def retrieve(cfg: Config, embeddings: Embeddings, query: str, role: Role) -> list[Hit]:
@@ -152,31 +289,26 @@ def retrieve(cfg: Config, embeddings: Embeddings, query: str, role: Role) -> lis
     if not vectors:
         return []
     hits = store.query(cfg, vectors[0], pinecone_filter(role), cfg.top_k)
-    if role == "technician":
-        hits = [hit for hit in hits if not PRICE.search(hit.text)]
-    return hits
+    return drop_technician_prices(role, hits)
 
 
 def decide(chat: Chat, query: str, hits: list[Hit]) -> str:
     user = f"Question: {query}\n\nChunks:\n{_hits_block(hits)}"
-    return _one_token(chat, DECIDE_SYS, user, ok="ANSWER", closed="REFUSE")
+    return one_token(chat, DECIDE_SYS, user, allowed=ANSWER_TOKEN, closed="REFUSE")
 
 
 def explain_refuse(chat: Chat, query: str, hits: list[Hit]) -> str:
     user = json.dumps(
         {
             "query": query,
-            "chunks": [
-                {"id": hit.id, "title": hit.title, "path": hit.path, "text": hit.text}
-                for hit in hits
-            ],
+            "chunks": [_chunk_payload(hit) for hit in hits],
         },
         ensure_ascii=False,
     )
+    raw = chat.complete(system=REFUSE_SYS, user=user, json_object=True)
     try:
-        raw = chat.complete(system=REFUSE_SYS, user=user, json_object=True)
         data = json.loads(raw)
-    except Exception:
+    except ValueError:
         return format_refuse("UNKNOWN", "")
     if not isinstance(data, dict):
         return format_refuse("UNKNOWN", "")
@@ -188,8 +320,8 @@ def explain_refuse(chat: Chat, query: str, hits: list[Hit]) -> str:
 
 
 def format_refuse(reason: str, detail: str) -> str:
-    if reason not in REFUSE_REASONS:
-        reason = "UNKNOWN"
+    # AMBIGUOUS is an unclear question, not two documents that disagree.
+    # Disagreement is an ANSWER and never reaches this function.
     cleaned = _clean_detail(detail)
     if reason == "MISSING_INFO" and cleaned:
         return f"{REFUSE} Missing information: {cleaned}"
@@ -198,6 +330,8 @@ def format_refuse(reason: str, detail: str) -> str:
             "The question was too ambiguous to answer. "
             f"Please clarify {cleaned} in your question and ask again."
         )
+    if reason == "UNKNOWN" and cleaned:
+        return f"{REFUSE} Related topic: {cleaned}"
     return REFUSE
 
 
@@ -205,17 +339,14 @@ def generate(chat: Chat, query: str, hits: list[Hit]) -> Draft | None:
     user = json.dumps(
         {
             "query": query,
-            "chunks": [
-                {"id": hit.id, "title": hit.title, "path": hit.path, "text": hit.text}
-                for hit in hits
-            ],
+            "chunks": [_chunk_payload(hit) for hit in hits],
         },
         ensure_ascii=False,
     )
+    raw = chat.complete(system=GEN_SYS, user=user, json_object=True)
     try:
-        raw = chat.complete(system=GEN_SYS, user=user, json_object=True)
         data = json.loads(raw)
-    except Exception:
+    except ValueError:
         return None
     if not isinstance(data, dict):
         return None
@@ -225,10 +356,74 @@ def generate(chat: Chat, query: str, hits: list[Hit]) -> Draft | None:
         return None
     if not all(isinstance(item, str) for item in ids):
         return None
-    return Draft(answer=answer, citation_ids=ids)
+    note = data.get("outdated_note")
+    return Draft(
+        answer=answer,
+        citation_ids=ids,
+        outdated_note=note if isinstance(note, str) else None,
+    )
+
+
+def superseded_hits(usable: list[Hit], cited: list[Hit]) -> list[Hit]:
+    """Outdated hits that are an older revision of a cited current document.
+
+    Same model and doc_type as a cited current chunk. A legacy spec next to
+    the current spec qualifies; a legacy spec next to a pricing sheet does not.
+    """
+    current = {(hit.model, hit.doc_type) for hit in cited if not hit.flagged_outdated}
+    return [
+        hit
+        for hit in usable
+        if hit.flagged_outdated and (hit.model, hit.doc_type) in current
+    ]
+
+
+_NUMBER = re.compile(r"\d[\d,.\-]*\d|\d")
+_OUTDATED_SENTENCE = re.compile(r"[^.!?\n]*\boutdated\b[^.!?\n]*[.!?]?[ \t]*", re.I)
+
+
+def outdated_note(note: str | None, superseded: list[Hit]) -> str | None:
+    """The line under the answer when a superseded revision was retrieved.
+
+    The model's sentence is used only if every number in it appears in the
+    superseded text, so it cannot misquote the old value. Otherwise, or when
+    the model gave no sentence, a canned line names the document. No
+    superseded hit means no note, whatever the model said.
+    """
+    if not superseded:
+        return None
+    blob = " ".join(f"{hit.title} {hit.text}" for hit in superseded)
+    cleaned = " ".join((note or "").split())
+    if cleaned and all(number in blob for number in _NUMBER.findall(cleaned)):
+        return cleaned
+    titles = "; ".join(
+        f"{hit.title} ({hit.path})" for hit in _unique_by_doc(superseded)
+    )
+    return (
+        "Note: a superseded revision is also on file and may list different "
+        f"values: {titles}. This answer uses the current document."
+    )
+
+
+def strip_outdated_claims(answer: str) -> str:
+    # No superseded revision was retrieved, so any sentence about an
+    # outdated document is the model inventing a conflict. Drop it.
+    return _OUTDATED_SENTENCE.sub("", answer).strip()
+
+
+def _unique_by_doc(hits: list[Hit]) -> list[Hit]:
+    seen: set[str] = set()
+    out: list[Hit] = []
+    for hit in hits:
+        if hit.doc_id not in seen:
+            seen.add(hit.doc_id)
+            out.append(hit)
+    return out
 
 
 def receipt_ok(ids: list[str], hits: list[Hit]) -> bool:
+    # The model must point at chunks we actually retrieved. An empty list
+    # or an id it invented fails the receipt and the answer is not shown.
     allowed = {hit.id for hit in hits}
     return bool(ids) and all(item in allowed for item in ids)
 
@@ -248,53 +443,28 @@ def print_sources(ids: list[str], hits: list[Hit]) -> None:
         print(f"- {hit.title} ({hit.path}, {hit.id})")
 
 
-def outdated_siblings(hits: list[Hit], rows: list[ManifestRow]) -> list[ManifestRow]:
-    keys = {(hit.model, hit.doc_type) for hit in hits}
-    return [
-        row
-        for row in rows
-        if row.flagged_outdated and (row.model, row.doc_type) in keys
-    ]
-
-
-def print_outdated_siblings(hits: list[Hit], rows: list[ManifestRow]) -> None:
-    for row in outdated_siblings(hits, rows):
-        print(
-            "Outdated revision (not used): "
-            f"{row.title} — {row.version} ({row.doc_id}, {row.path})"
-        )
-
-
-def _one_token(chat: Chat, system: str, user: str, *, ok: str, closed: str) -> str:
-    try:
-        raw = chat.complete(system=system, user=user)
-    except Exception:
-        return closed
-    stripped = (raw or "").strip()
-    if not stripped:
-        return closed
-    parts = stripped.split()
-    if len(parts) != 1 or parts[0].upper() != ok:
-        return closed
-    return ok
-
-
 def _clean_detail(detail: str) -> str:
+    # A long detail is the model slipping into an answer. Drop it and use
+    # the canned refuse line instead.
     cleaned = " ".join((detail or "").split())
     if len(cleaned) > 120:
         return ""
     return cleaned
 
 
+def _chunk_payload(hit: Hit) -> dict:
+    return {
+        "id": hit.id,
+        "title": hit.title,
+        "path": hit.path,
+        "text": hit.text,
+        "flagged_outdated": hit.flagged_outdated,
+    }
+
+
 def _hits_block(hits: list[Hit]) -> str:
     blocks = []
     for i, hit in enumerate(hits, start=1):
-        blocks.append(f"{i}. {hit.id} | {hit.title} | {hit.path}\n{hit.text}")
+        flag = "outdated" if hit.flagged_outdated else "current"
+        blocks.append(f"{i}. {hit.id} | {hit.title} | {hit.path} | {flag}\n{hit.text}")
     return "\n\n".join(blocks)
-
-
-def _load_rows(cfg: Config) -> list[ManifestRow]:
-    try:
-        return load_manifest(cfg.corpus_dir)
-    except Exception:
-        return []

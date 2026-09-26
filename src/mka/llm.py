@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import time
 from typing import Protocol
 
 from openai import OpenAI
 
+from mka import usage
 from mka.config import Config
 
 EMBED_BATCH = 64
@@ -26,17 +28,24 @@ class OpenAIChat:
         kwargs: dict = {}
         if json_object:
             kwargs["response_format"] = {"type": "json_object"}
-        response = self._client.chat.completions.create(
-            model=self._model,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            **kwargs,
-        )
-        content = response.choices[0].message.content
-        return (content or "").strip()
+        started = time.perf_counter()
+        response = None
+        try:
+            # Gates and the answer both run at temperature 0. A creative
+            # sample is how a citation id or a one-token decision drifts.
+            response = self._client.chat.completions.create(
+                model=self._model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                **kwargs,
+            )
+            content = response.choices[0].message.content
+            return (content or "").strip()
+        finally:
+            usage.record_chat(self._model, response, usage.elapsed_ms(started))
 
 
 class OpenAIEmbeddings:
@@ -51,9 +60,14 @@ class OpenAIEmbeddings:
         out: list[list[float]] = []
         for start in range(0, len(texts), self._batch_size):
             batch = texts[start : start + self._batch_size]
-            response = self._client.embeddings.create(model=self._model, input=batch)
-            ordered = sorted(response.data, key=lambda item: item.index)
-            out.extend([item.embedding for item in ordered])
+            started = time.perf_counter()
+            response = None
+            try:
+                response = self._client.embeddings.create(model=self._model, input=batch)
+                ordered = sorted(response.data, key=lambda item: item.index)
+                out.extend([item.embedding for item in ordered])
+            finally:
+                usage.record_embed(self._model, response, usage.elapsed_ms(started))
         return out
 
 

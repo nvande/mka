@@ -1,0 +1,94 @@
+{
+  "families": [
+    {
+      "family": "dock leveler",
+      "models": ["MD-5000", "MD-7000", "MD-9000"],
+      "synonyms": [
+        "dock leveler",
+        "dock levelers",
+        "dock leveller",
+        "dock levellers",
+        "leveler",
+        "levelers",
+        "leveller",
+        "levellers",
+        "dockboard",
+        "dockboards",
+        "dock board",
+        "dock boards",
+        "mechanical leveler",
+        "hydraulic leveler",
+        "air-powered leveler",
+        "air powered leveler",
+        "pneumatic leveler",
+        "air bag leveler",
+        "pit leveler"
+      ]
+    },
+    {
+      "family": "industrial door",
+      "models": ["RapidRoll 400", "ThermaGuard 600"],
+      "synonyms": [
+        "rapidroll",
+        "rapid roll",
+        "thermaguard",
+        "therma guard",
+        "high-speed door",
+        "high speed door",
+        "high-speed doors",
+        "roll-up door",
+        "rollup door",
+        "insulated door",
+        "insulated sectional door",
+        "sectional door",
+        "sectional doors",
+        "overhead door",
+        "overhead doors",
+        "industrial door",
+        "industrial doors",
+        "freezer door",
+        "warehouse door"
+      ]
+    },
+    {
+      "family": "vehicle restraint",
+      "models": ["DockGuard"],
+      "synonyms": [
+        "dockguard",
+        "dock guard",
+        "vehicle restraint",
+        "vehicle restraints",
+        "trailer restraint",
+        "truck restraint",
+        "dock restraint",
+        "trailer lock",
+        "truck lock",
+        "icc bar lock"
+      ]
+    },
+    {
+      "family": "dock equipment",
+      "models": [],
+      "synonyms": [
+        "dock equipment",
+        "docking equipment",
+        "loading dock",
+        "loading docks"
+      ]
+    }
+  ],
+  "components": [
+    { "term": "photo-eye", "family": "industrial door" },
+    { "term": "photo eye", "family": "industrial door" },
+    { "term": "photoeye", "family": "industrial door" },
+    { "term": "photocell", "family": "industrial door" },
+    { "term": "heated track", "family": "industrial door" },
+    { "term": "heated tracks", "family": "industrial door" },
+    { "term": "torsion spring", "family": "industrial door" },
+    { "term": "stainless lip", "family": "dock leveler" },
+    { "term": "stainless steel lip", "family": "dock leveler" },
+    { "term": "air bag", "family": "dock leveler" },
+    { "term": "airbag", "family": "dock leveler" },
+    { "term": "velocity fuse", "family": "dock leveler" }
+  ]
+}

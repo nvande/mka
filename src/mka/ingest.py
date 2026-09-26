@@ -1,3 +1,11 @@
+"""Ingest. Join the manifest, chunk, embed, replace the namespace.
+
+A bad row fails that file and does not upsert it. The rest of the corpus
+still loads. The namespace wipe is safe here because this command is the
+only writer and the corpus is the whole index. A second live source must
+not share this replace.
+"""
+
 from __future__ import annotations
 
 import json
@@ -5,28 +13,81 @@ import os
 import re
 import sys
 
-from mka import store
-from mka.chunking import ChunkError, chunk_document
+from mka import store, usage
+from mka.chunking import ChunkError, attach_warnings, chunk_document
 from mka.config import Config
-from mka.llm import make_embeddings
+from mka.llm import make_chat, make_embeddings
+from mka.safety import classify_source_warnings
+from mka.spinner import Spinner
 from mka.types import Chunk, ManifestRow, load_manifest
 
 ALLOWED_AUDIENCE = frozenset({"sales", "technician", "all"})
 VERSION_RE = re.compile(r"^\d{4}-\d{2}$")
 
 
-def run_ingest(cfg: Config) -> int:
+def run_ingest(cfg: Config, *, stats: bool = False) -> int:
+    return usage.reported("ingest", lambda: _run_ingest(cfg), stats=stats)
+
+
+def _run_ingest(cfg: Config) -> int:
     chunks, errors = prepare_chunks(cfg)
     for message in errors:
         print(message, file=sys.stderr)
     if chunks:
+        spin = Spinner()
         try:
+            _cache_warnings(cfg, chunks)
             _write_index(cfg, chunks)
         except Exception as exc:
+            spin.stop()
             print(f"error: {exc}", file=sys.stderr)
             return 1
+        finally:
+            spin.stop()
     print(f"chunks: {len(chunks)}")
     return 1 if errors else 0
+
+
+def _cache_warnings(cfg: Config, chunks: list[Chunk]) -> None:
+    # Warning cache ingest. One classify per source file, copied onto every
+    # chunk from that file, so the ask path reads it instead of calling the
+    # model. A file that fails here keeps an empty cache and ask gates it live.
+    if not os.getenv("OPENAI_API_KEY"):
+        return
+    try:
+        chat = make_chat(cfg)
+    except Exception as exc:
+        print(f"warning: warning cache skipped: {exc}", file=sys.stderr)
+        return
+    cached = 0
+    for group in _by_doc(chunks).values():
+        meta = group[0].metadata
+        try:
+            text = (cfg.corpus_dir / str(meta["path"])).read_text(encoding="utf-8")
+            excerpts = classify_source_warnings(
+                chat,
+                doc_id=str(meta["doc_id"]),
+                title=str(meta["title"]),
+                path=str(meta["path"]),
+                text=text,
+            )
+        except Exception as exc:
+            print(f"warning: {meta['doc_id']}: warning cache skipped: {exc}", file=sys.stderr)
+            continue
+        if excerpts is None:
+            continue
+        rows = [(item.text, item.audience) for item in excerpts]
+        for chunk in group:
+            if attach_warnings(chunk, rows):
+                cached += 1
+    print(f"warnings: cached on {cached}/{len(chunks)} chunks")
+
+
+def _by_doc(chunks: list[Chunk]) -> dict[str, list[Chunk]]:
+    groups: dict[str, list[Chunk]] = {}
+    for chunk in chunks:
+        groups.setdefault(str(chunk.metadata["doc_id"]), []).append(chunk)
+    return groups
 
 
 def _write_index(cfg: Config, chunks: list[Chunk]) -> None:
@@ -39,6 +100,7 @@ def _write_index(cfg: Config, chunks: list[Chunk]) -> None:
     if len(values) != len(chunks):
         raise RuntimeError("embedding count does not match chunk count")
     store.ensure_index(cfg)
+    # Full replace. A doc removed from the corpus must not keep answering.
     store.wipe_namespace(cfg)
     store.upsert(cfg, chunks, values)
 
@@ -71,6 +133,8 @@ def prepare_chunks(cfg: Config) -> tuple[list[Chunk], list[str]]:
         except (OSError, ChunkError) as exc:
             errors.append(f"error: {row.doc_id}: {exc}")
 
+    # A markdown file with no manifest row has no audience or version.
+    # Fail it instead of embedding an unlabeled chunk.
     listed = {row.path for row in rows}
     docs_dir = cfg.corpus_dir / "docs"
     if docs_dir.is_dir():
@@ -82,6 +146,8 @@ def prepare_chunks(cfg: Config) -> tuple[list[Chunk], list[str]]:
 
 
 def _allowlist_error(row: ManifestRow) -> str | None:
+    # Pinecone filters are exact. An unknown audience or a version that is
+    # not YYYY-MM would slip past the role filter, so the row is rejected.
     if row.audience not in ALLOWED_AUDIENCE:
         return f"error: {row.doc_id}: invalid audience {row.audience!r}"
     if not VERSION_RE.fullmatch(row.version):

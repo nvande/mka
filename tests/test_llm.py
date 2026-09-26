@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mka import usage
 from mka.llm import OpenAIChat, OpenAIEmbeddings, make_chat, make_embeddings
 
 from conftest import make_config
@@ -41,6 +42,28 @@ def test_embeddings_batch_at_64() -> None:
     vectors = embedder.embed(["t"] * 65)
     assert len(vectors) == 65
     assert api.batch_sizes == [64, 1]
+
+
+def test_embeddings_record_token_cost_per_batch(tmp_path: Path) -> None:
+    class _UsageEmbedAPI:
+        def create(self, model: str, input: list[str]) -> SimpleNamespace:
+            del model
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(index=i, embedding=[0.0]) for i in range(len(input))
+                ],
+                usage=SimpleNamespace(prompt_tokens=len(input), total_tokens=len(input)),
+            )
+
+    client = SimpleNamespace(embeddings=_UsageEmbedAPI())
+    embedder = OpenAIEmbeddings(client, "text-embedding-3-small", batch_size=64)
+    with usage.track("ingest") as ledger:
+        vectors = embedder.embed(["t"] * 65)
+    assert len(vectors) == 65
+    assert [call.prompt_tokens for call in ledger.calls] == [64, 1]
+    # 65 * $0.02 / 1M
+    assert "token_cost_usd: 0.00000130" in usage.render(ledger)
+    assert "embed_calls: 2" in usage.render(ledger)
 
 
 def test_embeddings_empty() -> None:

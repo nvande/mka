@@ -50,6 +50,9 @@ def load_config() -> Config:
         chat_model=os.getenv("CHAT_MODEL", "gpt-5.4-nano"),
         embed_model=os.getenv("EMBED_MODEL", "text-embedding-3-small"),
         embed_dim=int(os.getenv("EMBED_DIM", "1536")),
+        # Eight chunks is most of what a role can see in this corpus.
+        # The floor only drops an empty retrieve. The evidence decision still judges
+        # whatever is left. Neither value is a rerank.
         top_k=int(os.getenv("TOP_K", "8")),
         retrieve_floor=float(os.getenv("RETRIEVE_FLOOR", "0.20")),
         max_query_chars=int(os.getenv("MAX_QUERY_CHARS", "4000")),

@@ -1,3 +1,9 @@
+"""Closed catalog fields copied onto each vector.
+
+flagged_outdated is stored and is not a retrieve filter. Ask uses it as
+the winner rule when an old revision and a current one disagree.
+"""
+
 from __future__ import annotations
 
 import json
@@ -38,8 +44,14 @@ class Hit:
     doc_id: str
     model: str
     doc_type: str
+    flagged_outdated: bool
     contains_warning: bool
     warning_text: str
+    # Check 5 cache. warnings_cached false means ingest never classified this
+    # file, so ask runs the live pass for the whole cited set.
+    warnings_cached: bool = False
+    warning_excerpts: tuple[str, ...] = ()
+    warning_audiences: tuple[str, ...] = ()
 
 
 def load_manifest(corpus_dir: Path) -> list[ManifestRow]:
