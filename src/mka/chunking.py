@@ -207,7 +207,7 @@ def _fit_size(row: ManifestRow, piece: _Piece) -> list[Chunk]:
     # pieces keep the same preamble and tail, so a DANGER above the first
     # issue stays on every piece.
     chunk = _make_chunk(row, piece.chunk_id, piece.body)
-    if not _over_limit(chunk):
+    if not over_limit(chunk):
         return [chunk]
     if piece.preamble or piece.tail:
         middle = _unstaple(piece.body, piece.preamble, piece.tail)
@@ -219,7 +219,7 @@ def _fit_size(row: ManifestRow, piece: _Piece) -> list[Chunk]:
             part_id = f"{piece.chunk_id}::{i}"
             body = _join_staple(piece.preamble, part, piece.tail)
             extra = _make_chunk(row, part_id, body)
-            if _over_limit(extra):
+            if over_limit(extra):
                 raise ChunkError(f"{part_id} exceeds embed or metadata size")
             fitted.append(extra)
         return fitted
@@ -230,7 +230,7 @@ def _fit_size(row: ManifestRow, piece: _Piece) -> list[Chunk]:
     for i, part in enumerate(parts):
         part_id = f"{row.doc_id}::{i}"
         extra = _make_chunk(row, part_id, part)
-        if _over_limit(extra):
+        if over_limit(extra):
             raise ChunkError(f"{part_id} exceeds embed or metadata size")
         fitted.append(extra)
     return fitted
@@ -267,9 +267,8 @@ def _metadata(row: ManifestRow, text: str) -> dict:
         "flagged_outdated": row.flagged_outdated,
         # doc_type is not trusted. A FAQ row can still contain a price.
         "contains_pricing": contains_pricing(text),
-        # Check 5 cache. Empty at chunk time because the classifier has not
-        # run yet. attach_warnings fills these once ingest has read the whole
-        # source file, and the ask-time pass reads them instead of the model.
+        # Hazard-note cache. Empty at chunk time; safety.assign_warnings
+        # fills these once ingest has read the whole source file.
         "contains_warning": False,
         "warning_text": "",
         "warnings_cached": False,
@@ -279,32 +278,7 @@ def _metadata(row: ManifestRow, text: str) -> dict:
     }
 
 
-def attach_warnings(chunk: Chunk, excerpts: list[tuple[str, str]]) -> bool:
-    """Copy one file's verified (excerpt, audience) rows onto a record.
-
-    False leaves the record untouched: the excerpts pushed metadata past the
-    cap, so this chunk keeps an empty cache and ask runs the live pass for it.
-    warning_text stays the raw join so excerpt_in_source still sees a verbatim
-    substring after a split drops the surrounding section.
-    """
-    saved = dict(chunk.metadata)
-    chunk.metadata.update(
-        {
-            "contains_warning": bool(excerpts),
-            "warning_text": "\n\n".join(text for text, _ in excerpts),
-            "warnings_cached": True,
-            "warning_excerpts": [text for text, _ in excerpts],
-            "warning_audiences": [audience for _, audience in excerpts],
-        }
-    )
-    if _over_limit(chunk):
-        chunk.metadata.clear()
-        chunk.metadata.update(saved)
-        return False
-    return True
-
-
-def _over_limit(chunk: Chunk) -> bool:
+def over_limit(chunk: Chunk) -> bool:
     if token_len(chunk.text) > MAX_EMBED_TOKENS:
         return True
     packed = json.dumps(chunk.metadata, ensure_ascii=False).encode()

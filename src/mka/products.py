@@ -103,6 +103,49 @@ def _build_patterns() -> list[tuple[re.Pattern[str], str, str]]:
 _PATTERNS = _build_patterns()
 
 
+def _build_model_patterns() -> list[tuple[re.Pattern[str], str]]:
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for family in FAMILIES:
+        for model in family.models:
+            for alias in _model_aliases(model):
+                key = alias.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append((alias, model))
+    unique.sort(key=lambda item: len(item[0]), reverse=True)
+    return [
+        (re.compile(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", re.I), model)
+        for alias, model in unique
+    ]
+
+
+_MODEL_PATTERNS = _build_model_patterns()
+
+
+def canonical_models_in(text: str) -> list[str]:
+    """Canonical catalog model names mentioned in text, longest match first.
+
+    Family synonyms such as "leveler" do not count. Follow-up retrieve and
+    citation completion use this so a FAQ that names RapidRoll 400 can pull
+    that spec without embedding every dock leveler.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    seen_spans: list[tuple[int, int]] = []
+    for pattern, model in _MODEL_PATTERNS:
+        for hit in pattern.finditer(text):
+            span = hit.span()
+            if any(span[0] >= start and span[1] <= end for start, end in seen_spans):
+                continue
+            seen_spans.append(span)
+            if model not in seen:
+                seen.add(model)
+                found.append(model)
+    return found
+
+
 def match_product_terms(query: str) -> list[tuple[str, str]]:
     """Return (matched term, family) for catalog words in the query.
 

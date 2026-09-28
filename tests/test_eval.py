@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from mka.cli import main
-from mka.eval import cited_ids, run_eval
+from mka.eval import cited_ids, run_eval, score_output
 
 from conftest import make_config
 
@@ -88,19 +88,38 @@ def test_cited_ids_parses_sources_block() -> None:
     assert cited_ids("I don't have enough information.\nRelated:\n- A (docs/a.md)\n") == []
 
 
+def test_score_output_partial_sources_and_strings() -> None:
+    out = "40,000 lbs.\nSources:\n- S (docs/spec_md9000.md, spec_md9000::0)\n"
+    result = score_output(
+        out,
+        expected=["spec_md9000", "faq_selection_guide"],
+        contain=["40,000", "MD-9000"],
+        avoid=["outdated"],
+    )
+    # cited spec, missing faq; has 40,000, missing MD-9000; avoided outdated
+    assert result.earned == 3
+    assert result.possible == 5
+    assert result.score == 60
+    assert result.problems == [
+        "missing source faq_selection_guide",
+        "missing text 'MD-9000'",
+    ]
+
+
 def test_eval_grades_both_roles_and_filters_hidden_sources(corpus: Path, capsys) -> None:
     code = run_eval(make_config(corpus))
     out = capsys.readouterr().out
     assert code == 1
-    assert "q1_simple_lookup [sales]  PASS" in out
-    assert "q1_simple_lookup [technician]  PASS" in out
-    assert "q5_role_scoped [sales]  PASS" in out
-    assert "q5_role_scoped [technician]  FAIL" in out
+    assert "q1_simple_lookup [sales]  100" in out
+    assert "q1_simple_lookup [technician]  100" in out
+    assert "q5_role_scoped [sales]  100" in out
+    assert "q5_role_scoped [technician]    0" in out
     assert "forbidden text '$'" in out
-    assert "missing text 'not available'" in out
-    assert "q6_procedural_detail [sales]  PASS" in out
-    assert "q6_procedural_detail [technician]  PASS" in out
-    assert "5/6 passed" in out
+    assert "missing text 'restricted to sales'" in out
+    assert "q6_procedural_detail [sales]  100" in out
+    assert "q6_procedural_detail [technician]  100" in out
+    # five 100s and a 0 → mean 83
+    assert "score: 83" in out
 
 
 def test_eval_via_cli(corpus: Path, monkeypatch: pytest.MonkeyPatch) -> None:

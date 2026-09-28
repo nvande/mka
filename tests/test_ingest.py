@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from mka.ingest import prepare_chunks, run_ingest
-from mka.safety import WarningExcerpt
 
 from conftest import make_config
 
@@ -141,55 +140,64 @@ def test_staple_fails_row(tmp_path: Path) -> None:
     assert any("stapled" in err for err in errors)
 
 
-def test_run_ingest_caches_warnings_on_every_chunk_of_a_file(
+FAQ_WITH_NOTES = """# FAQ: Cold Storage
+
+**Audience:** Sales team only — do not share with end customers without approval
+**Revision:** 2025-01
+
+## Q: Which leveler for a freezer dock?
+**A:** The MD-9000.
+
+## Q: Can the door run without the bottom seal?
+**A:** No.
+
+> ⚠ **WARNING**
+> Running without the seal ices the track.
+
+## Q: Lead time?
+**A:** Eight weeks.
+"""
+
+
+def test_run_ingest_scopes_warning_cache_by_where_the_note_lives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: object
+) -> None:
+    corpus = _write_corpus(
+        tmp_path,
+        [_row("faq_cold", doc_type="faq", model="")],
+        {"docs/faq_cold.md": FAQ_WITH_NOTES},
+    )
+    written: list[list] = []
+    monkeypatch.setattr("mka.ingest._write_index", lambda cfg, chunks: written.append(chunks))
+
+    assert run_ingest(make_config(corpus)) == 0
+    by_id = {chunk.id: chunk.metadata for chunk in written[0]}
+    assert sorted(by_id) == ["faq_cold::q0", "faq_cold::q1", "faq_cold::q2"]
+    header = "**Audience:** Sales team only — do not share with end customers without approval"
+    block = "> ⚠ **WARNING**\n> Running without the seal ices the track."
+    # The header note was dropped from every Q chunk, so it reaches all three.
+    for meta in by_id.values():
+        assert meta["warnings_cached"] is True
+        assert header in meta["warning_excerpts"]
+    # The blockquote sits inside one answer and reaches only that chunk.
+    assert block in by_id["faq_cold::q1"]["warning_excerpts"]
+    assert block not in by_id["faq_cold::q0"]["warning_excerpts"]
+    assert block not in by_id["faq_cold::q2"]["warning_excerpts"]
+    assert by_id["faq_cold::q1"]["warning_audiences"] == ["sales", "all"]
+    assert "warnings: cached on 3/3 chunks" in capsys.readouterr().out
+
+
+def test_run_ingest_caches_an_empty_pass_on_a_file_with_no_notes(
     fixture_corpus: Path, monkeypatch: pytest.MonkeyPatch, capsys: object
 ) -> None:
-    seen: list[str] = []
-
-    def fake_classify(chat, *, doc_id, title, path, text):
-        del chat, title, path, text
-        seen.append(doc_id)
-        return [WarningExcerpt("Never exceed 2,100 psi.", "technician")]
-
-    monkeypatch.setenv("OPENAI_API_KEY", "test")
-    monkeypatch.setattr("mka.ingest.classify_source_warnings", fake_classify)
-    monkeypatch.setattr("mka.ingest.make_chat", lambda cfg: object())
     written: list[list] = []
     monkeypatch.setattr("mka.ingest._write_index", lambda cfg, chunks: written.append(chunks))
 
     assert run_ingest(make_config(fixture_corpus)) == 0
-    # One classify per source file, not per chunk.
-    assert sorted(seen) == ["spec_current", "spec_legacy"]
     for chunk in written[0]:
         assert chunk.metadata["warnings_cached"] is True
-        assert chunk.metadata["warning_excerpts"] == ["Never exceed 2,100 psi."]
-        assert chunk.metadata["warning_audiences"] == ["technician"]
+        assert chunk.metadata["warning_excerpts"] == []
     assert "warnings: cached on 2/2 chunks" in capsys.readouterr().out
-
-
-def test_run_ingest_leaves_the_cache_empty_when_the_classifier_fails(
-    fixture_corpus: Path, monkeypatch: pytest.MonkeyPatch, capsys: object
-) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", "test")
-    monkeypatch.setattr(
-        "mka.ingest.classify_source_warnings", lambda chat, **kwargs: None
-    )
-    monkeypatch.setattr("mka.ingest.make_chat", lambda cfg: object())
-    written: list[list] = []
-    monkeypatch.setattr("mka.ingest._write_index", lambda cfg, chunks: written.append(chunks))
-
-    # Still upserts. Check 5 on ask is the gate for these chunks.
-    assert run_ingest(make_config(fixture_corpus)) == 0
-    assert all(not chunk.metadata["warnings_cached"] for chunk in written[0])
-    assert "warnings: cached on 0/2 chunks" in capsys.readouterr().out
-
-
-def test_run_ingest_skips_warning_cache_without_key(
-    fixture_corpus: Path, skip_index: None, monkeypatch: pytest.MonkeyPatch, capsys: object
-) -> None:
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    assert run_ingest(make_config(fixture_corpus)) == 0
-    assert "warnings:" not in capsys.readouterr().out
 
 
 def test_missing_corpus_dir(tmp_path: Path, capsys: object) -> None:

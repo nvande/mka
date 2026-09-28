@@ -17,7 +17,9 @@ from mka.ask import (
     SCOPE_SYS,
     TRIVIAL,
     TRIVIAL_TOO_LONG,
+    cap_per_doc,
     classify_scope,
+    complete_citations,
     explain_refuse,
     format_refuse,
     outdated_note,
@@ -31,7 +33,6 @@ from mka.ask import (
 )
 from mka.llm import OpenAIChat
 from mka.products import catalog_hint
-from mka.safety import WARN_SYS
 from mka.types import Hit
 
 from conftest import make_config
@@ -69,7 +70,7 @@ class FakeEmbeddings:
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         self.texts = texts
-        return [self.vector]
+        return [self.vector for _ in texts]
 
 
 def make_hit(**over: object) -> Hit:
@@ -90,6 +91,25 @@ def make_hit(**over: object) -> Hit:
     return Hit(**data)
 
 
+def systems(chat) -> list[str]:
+    return [call[0] for call in chat.calls]
+
+
+def only_call(chat, system: str) -> tuple[str, str, bool]:
+    matches = [call for call in chat.calls if call[0] == system]
+    assert len(matches) == 1, f"expected one {system[:30]!r} call, got {len(matches)}"
+    return matches[0]
+
+
+def assert_decided_and_drafted_together(chat, *, before: str, after: str | None) -> None:
+    # Generate runs on a worker thread alongside decide, so its position is
+    # unspecified. The main-thread sequence is fixed and each call runs once.
+    seen = systems(chat)
+    main_thread = [system for system in seen if system != GEN_SYS]
+    assert main_thread == [before, DECIDE_SYS] + ([after] if after else [])
+    assert seen.count(GEN_SYS) == 1
+
+
 def gen_json(answer: str, *ids: str, outdated_note: str | None = None) -> str:
     return json.dumps(
         {"answer": answer, "citation_ids": list(ids), "outdated_note": outdated_note}
@@ -104,10 +124,6 @@ LEGACY = dict(
     text="Revision: 2021-03. Rated lifting capacity: 30,000 lbs. Motor: 1.5 HP.",
     flagged_outdated=True,
 )
-
-
-def warn_json(*rows: dict) -> str:
-    return json.dumps({"warnings": list(rows)})
 
 
 def refuse_json(reason: str, detail: str = "") -> str:
@@ -186,7 +202,7 @@ def test_decide_and_generate_treat_conflict_as_answer() -> None:
     assert "do not mention outdated or superseded documents in the answer" in GEN_SYS
     assert '"outdated_note": string|null' in GEN_SYS
     assert "do not pick a winner" in GEN_SYS
-    assert "The {title} document lists the answer as {value}" in GEN_SYS
+    assert "Cite every provided chunk that states a product you named" in GEN_SYS
     assert "disagree on the same fact" in REFUSE_SYS
 
 
@@ -220,6 +236,26 @@ def test_run_ask_redirect_on_deny(tmp_path, capsys) -> None:
     assert chat.calls[0][0] == SCOPE_SYS
     assert chat.calls[0][1] == "Write me a poem"
     assert "sales" not in chat.calls[0][0].lower()
+
+
+def test_run_ask_missing_index_explains_ingest(tmp_path, capsys, monkeypatch) -> None:
+    class Missing:
+        def query(self, **kwargs):
+            raise RuntimeError("[404 NOT_FOUND] Resource mka-poc not found")
+
+    monkeypatch.setattr("mka.store._index", lambda cfg: Missing())
+    code = run_ask(
+        make_config(tmp_path),
+        "sales",
+        "MD-7000 capacity?",
+        chat=FakeChat("ALLOW"),
+        embeddings=FakeEmbeddings(),
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "Pinecone index 'mka-poc' does not exist" in captured.err
+    assert "mka ingest" in captured.err
+    assert "[404" not in captured.err
 
 
 def test_run_ask_reports_a_failed_gate_as_an_error_not_a_redirect(tmp_path, capsys) -> None:
@@ -382,7 +418,6 @@ def test_run_ask_sales_price_ask_is_not_denied(tmp_path, capsys) -> None:
             SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("$10,550.", hit.id),
-            WARN_SYS: warn_json({"id": hit.id, "excerpts": []}),
         }
     )
     code = run_ask(
@@ -448,7 +483,6 @@ def test_run_ask_superseded_revision_always_gets_a_note_and_source(tmp_path, cap
             SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("35,000 lbs.", current.id),
-            WARN_SYS: warn_json({"id": current.id, "excerpts": []}),
         }
     )
     code = run_ask(
@@ -479,7 +513,6 @@ def test_run_ask_superseded_note_from_model_when_grounded(tmp_path, capsys) -> N
                 legacy.id,
                 outdated_note="The superseded 2021-03 revision lists 30,000 lbs.",
             ),
-            WARN_SYS: warn_json({"id": current.id, "excerpts": []}),
         }
     )
     code = run_ask(
@@ -515,7 +548,6 @@ def test_run_ask_invented_outdated_claim_is_stripped(tmp_path, capsys) -> None:
                 hit.id,
                 outdated_note="An outdated document lists a conflicting temperature rating.",
             ),
-            WARN_SYS: warn_json({"id": hit.id, "excerpts": []}),
         }
     )
     code = run_ask(
@@ -582,9 +614,11 @@ def test_run_ask_decide_refuse_prints_missing_info(tmp_path, capsys) -> None:
     assert "Related:" in out
     assert "- MD-7000 Specification (docs/spec_md7000.md)" in out
     assert "Sources:" not in out
-    assert [call[0] for call in chat.calls] == [SCOPE_SYS, DECIDE_SYS, REFUSE_SYS]
-    assert chat.calls[2][2] is True
-    payload = json.loads(chat.calls[2][1])
+    # The draft was started alongside decide and discarded on REFUSE.
+    assert_decided_and_drafted_together(chat, before=SCOPE_SYS, after=REFUSE_SYS)
+    refuse_call = only_call(chat, REFUSE_SYS)
+    assert refuse_call[2] is True
+    payload = json.loads(refuse_call[1])
     assert payload["query"] == "CE number?"
     assert "role" not in payload
 
@@ -642,7 +676,7 @@ def test_run_ask_ambiguous_capacity_without_model(tmp_path, capsys) -> None:
     assert "- MD-5000 Specification (docs/spec_md5000.md)" in out
     assert "- MD-7000 Specification (docs/spec_md7000.md)" in out
     assert "- MD-9000 Specification (docs/spec_md9000.md)" in out
-    payload = json.loads(chat.calls[2][1])
+    payload = json.loads(only_call(chat, REFUSE_SYS)[1])
     assert payload["query"] == query
     assert [chunk["id"] for chunk in payload["chunks"]] == [
         "spec_md5000::0",
@@ -764,41 +798,18 @@ def test_run_ask_bad_citation_hides_answer(tmp_path, capsys) -> None:
     assert "Related:" in out
 
 
-def test_run_ask_check5_fail_closed_hides_answer(tmp_path, capsys) -> None:
-    hit = make_hit()
-    chat = ScriptedChat(
-        {
-            SCOPE_SYS: "ALLOW",
-            DECIDE_SYS: "ANSWER",
-            GEN_SYS: gen_json("35,000 lbs.", hit.id),
-            WARN_SYS: "not-json",
-        }
-    )
-    code = run_ask(
-        make_config(tmp_path),
-        "sales",
-        "MD-7000 capacity?",
-        chat=chat,
-        retriever=lambda query, role: [hit],
-    )
-    out = capsys.readouterr().out
-    assert code == 0
-    assert "35,000 lbs." not in out
-    assert REFUSE in out
-    assert "Related:" in out
-
-
 def test_run_ask_happy_path_prints_answer_staple_sources(
     tmp_path, capsys
 ) -> None:
-    excerpt = "Never exceed 2,100 psi."
-    hit = make_hit(text=f"Reset at 1,800 psi. {excerpt}", contains_warning=True)
+    # No ingest cache on this record, so the staple comes from extracting
+    # the chunk's own marked section. No model call is involved.
+    excerpt = "- **Never** exceed 2,100 psi."
+    hit = make_hit(text=f"Reset at 1,800 psi.\n\n## Safety limits\n\n{excerpt}\n")
     chat = ScriptedChat(
         {
             SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("35,000 lbs.", hit.id),
-            WARN_SYS: warn_json({"id": hit.id, "excerpts": [excerpt]}),
         }
     )
     code = run_ask(
@@ -816,16 +827,42 @@ def test_run_ask_happy_path_prints_answer_staple_sources(
     assert excerpt in out
     assert f"- MD-7000 Specification (docs/spec_md7000.md, {hit.id})" in out
     assert "Outdated revision" not in out
-    systems = [call[0] for call in chat.calls]
-    assert systems == [SCOPE_SYS, DECIDE_SYS, GEN_SYS, WARN_SYS]
-    assert chat.calls[2][2] is True
-    assert chat.calls[3][2] is True
-    gen_payload = json.loads(chat.calls[2][1])
+    assert_decided_and_drafted_together(chat, before=SCOPE_SYS, after=None)
+    gen_call = only_call(chat, GEN_SYS)
+    assert gen_call[2] is True
+    gen_payload = json.loads(gen_call[1])
     assert gen_payload["query"] == "MD-7000 capacity?"
     assert "role" not in gen_payload
     assert gen_payload["chunks"][0]["flagged_outdated"] is False
-    warn_payload = json.loads(chat.calls[3][1])
-    assert warn_payload["query"] == "MD-7000 capacity?"
+
+
+def test_run_ask_stale_cache_falls_back_to_the_chunk_text(tmp_path, capsys) -> None:
+    # The cached excerpt no longer appears in the record: the cache drifted.
+    # Ask ignores it and extracts from the chunk instead of trusting it.
+    hit = make_hit(
+        text="Reset at 1,800 psi.\n\n## Safety limits\n\n- Never exceed 2,100 psi.\n",
+        warnings_cached=True,
+        warning_excerpts=("Stale text that is not in the chunk.",),
+        warning_audiences=("all",),
+    )
+    chat = ScriptedChat(
+        {
+            SCOPE_SYS: "ALLOW",
+            DECIDE_SYS: "ANSWER",
+            GEN_SYS: gen_json("1,800 psi.", hit.id),
+        }
+    )
+    code = run_ask(
+        make_config(tmp_path),
+        "technician",
+        "Reset pressure?",
+        chat=chat,
+        retriever=lambda query, role: [hit],
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Stale text" not in out
+    assert "- Never exceed 2,100 psi." in out
 
 
 def test_run_ask_staples_from_the_ingest_cache_without_a_warn_call(
@@ -839,7 +876,6 @@ def test_run_ask_staples_from_the_ingest_cache_without_a_warn_call(
         warning_excerpts=(excerpt,),
         warning_audiences=("all",),
     )
-    # No WARN_SYS entry: ScriptedChat would fail if Check 5 called the model.
     chat = ScriptedChat(
         {
             SCOPE_SYS: "ALLOW",
@@ -858,7 +894,81 @@ def test_run_ask_staples_from_the_ingest_cache_without_a_warn_call(
     assert code == 0
     assert "35,000 lbs." in out
     assert excerpt in out
-    assert [call[0] for call in chat.calls] == [SCOPE_SYS, DECIDE_SYS, GEN_SYS]
+    assert_decided_and_drafted_together(chat, before=SCOPE_SYS, after=None)
+
+
+def test_run_ask_refuse_discards_a_finished_draft(tmp_path, capsys) -> None:
+    # Generate returned a perfectly valid answer. Decide said REFUSE. The
+    # answer must not print, and its citations must not appear.
+    hit = make_hit()
+    chat = ScriptedChat(
+        {
+            SCOPE_SYS: "ALLOW",
+            DECIDE_SYS: "REFUSE",
+            GEN_SYS: gen_json("35,000 lbs. Trust me.", hit.id),
+            REFUSE_SYS: refuse_json("MISSING_INFO", "the asked value"),
+        }
+    )
+    code = run_ask(
+        make_config(tmp_path),
+        "sales",
+        "MD-7000 capacity?",
+        chat=chat,
+        retriever=lambda query, role: [hit],
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Trust me" not in out
+    assert "Sources:" not in out
+    assert f"{REFUSE} Missing information: the asked value" in out
+    assert_decided_and_drafted_together(chat, before=SCOPE_SYS, after=REFUSE_SYS)
+
+
+def test_run_ask_refuse_ignores_a_draft_that_errored(tmp_path, capsys) -> None:
+    # A transport error in the speculative draft is irrelevant on REFUSE.
+    hit = make_hit()
+    chat = ScriptedChat(
+        {
+            SCOPE_SYS: "ALLOW",
+            DECIDE_SYS: "REFUSE",
+            GEN_SYS: RuntimeError("draft connection dropped"),
+            REFUSE_SYS: refuse_json("UNKNOWN", ""),
+        }
+    )
+    code = run_ask(
+        make_config(tmp_path),
+        "sales",
+        "MD-7000 capacity?",
+        chat=chat,
+        retriever=lambda query, role: [hit],
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert REFUSE in captured.out
+    assert captured.err == ""
+
+
+def test_run_ask_answer_surfaces_a_draft_that_errored(tmp_path, capsys) -> None:
+    # Decide said ANSWER but the draft call failed: that is an outage, exit 1.
+    hit = make_hit()
+    chat = ScriptedChat(
+        {
+            SCOPE_SYS: "ALLOW",
+            DECIDE_SYS: "ANSWER",
+            GEN_SYS: RuntimeError("draft connection dropped"),
+        }
+    )
+    code = run_ask(
+        make_config(tmp_path),
+        "sales",
+        "MD-7000 capacity?",
+        chat=chat,
+        retriever=lambda query, role: [hit],
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert REFUSE not in captured.out
+    assert "error: draft connection dropped" in captured.err
 
 
 def test_run_ask_clean_warnings_skip_staple(tmp_path, capsys) -> None:
@@ -868,7 +978,6 @@ def test_run_ask_clean_warnings_skip_staple(tmp_path, capsys) -> None:
             SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("35,000 lbs.", hit.id),
-            WARN_SYS: warn_json({"id": hit.id, "excerpts": []}),
         }
     )
     code = run_ask(
@@ -881,7 +990,7 @@ def test_run_ask_clean_warnings_skip_staple(tmp_path, capsys) -> None:
     out = capsys.readouterr().out
     assert code == 0
     assert "35,000 lbs." in out
-    assert "SAFETY" not in out
+    assert "⚠ WARNING" not in out
     assert "Sources:" in out
 
 
@@ -897,7 +1006,6 @@ def test_run_ask_hides_sales_note_from_technician(tmp_path, capsys) -> None:
             SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("No CE mark as stock.", hit.id),
-            WARN_SYS: warn_json({"id": hit.id, "excerpts": [note]}),
         }
     )
     code = run_ask(
@@ -934,5 +1042,69 @@ def test_retrieve_uses_role_filter_and_price_belt(tmp_path, monkeypatch) -> None
     assert embeddings.texts == ["capacity?"]
     assert captured["vector"] == [0.3, 0.4]
     assert captured["filter"] == pinecone_filter("technician")
-    assert captured["top_k"] == cfg.top_k
+    assert captured["top_k"] == cfg.retrieve_pool
     assert [hit.id for hit in out] == ["ok::0"]
+
+
+def test_cap_per_doc_keeps_order_and_limit() -> None:
+    hits = [
+        make_hit(id="faq::q0", doc_id="faq"),
+        make_hit(id="faq::q1", doc_id="faq"),
+        make_hit(id="faq::q2", doc_id="faq"),
+        make_hit(id="spec::0", doc_id="spec"),
+    ]
+    assert [hit.id for hit in cap_per_doc(hits, 2)] == ["faq::q0", "faq::q1", "spec::0"]
+    assert [hit.id for hit in cap_per_doc(hits, 0)] == [hit.id for hit in hits]
+
+
+def test_complete_citations_adds_retrieved_docs_that_name_the_same_model() -> None:
+    faq = make_hit(
+        id="faq::q0",
+        doc_id="faq_selection_guide",
+        text="The MD-5000 is not rated for true freezer environments. Specify the MD-9000.",
+    )
+    cold = make_hit(
+        id="faq_cold_storage::q0",
+        doc_id="faq_cold_storage",
+        text="The standard recommendation is an MD-9000 air-powered dock leveler.",
+    )
+    ids = complete_citations([faq.id], "Specify the MD-9000 air-powered model.", [faq, cold])
+    assert ids == [faq.id, cold.id]
+
+
+def test_complete_citations_skips_docs_already_cited() -> None:
+    a = make_hit(id="a::0", doc_id="spec_md9000", text="MD-9000 capacity 40,000")
+    b = make_hit(id="a::1", doc_id="spec_md9000", text="MD-9000 temperature -40")
+    assert complete_citations([a.id], "The MD-9000 is rated to -40°F.", [a, b]) == [a.id]
+
+
+def test_retrieve_follow_up_pulls_missing_model_spec(tmp_path, monkeypatch) -> None:
+    faq = make_hit(
+        id="faq::q0",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="Pair the MD-9000 with a ThermaGuard 600 and a RapidRoll 400.",
+        score=0.7,
+    )
+    spec = make_hit(
+        id="spec_thermaguard600::0",
+        doc_id="spec_thermaguard600",
+        doc_type="spec",
+        title="ThermaGuard 600 Insulated Sectional Door",
+        text="ThermaGuard 600 insulated door for cold storage.",
+        score=0.6,
+    )
+    calls: list[int] = []
+
+    def fake_query(cfg, vector, filter, top_k):
+        calls.append(top_k)
+        if len(calls) == 1:
+            return [faq]
+        return [spec]
+
+    monkeypatch.setattr("mka.ask.store.query", fake_query)
+    out = retrieve(make_config(tmp_path), FakeEmbeddings(), "freezer dock?", "sales")
+    assert [hit.id for hit in out] == [faq.id, spec.id]
+    assert calls[0] == make_config(tmp_path).retrieve_pool
+    assert calls[1] == 4
+

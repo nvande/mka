@@ -105,6 +105,20 @@ def test_query_maps_hit_and_records_stats(tmp_path, monkeypatch) -> None:
     assert call.detail == {"namespace": "poc", "top_k": 8, "matches": 1, "read_units": 1}
 
 
+def test_query_missing_index_explains_ingest(tmp_path, monkeypatch) -> None:
+    class Missing:
+        def query(self, **kwargs):
+            raise RuntimeError("[404 NOT_FOUND] Resource mka-poc not found")
+
+    monkeypatch.setattr("mka.store._index", lambda cfg: Missing())
+    with pytest.raises(RuntimeError, match="does not exist") as excinfo:
+        query(make_config(tmp_path), [0.1], {"doc_type": {"$ne": "service"}}, 8)
+    message = str(excinfo.value)
+    assert "mka-poc" in message
+    assert "mka ingest" in message
+    assert "404" not in message
+
+
 def test_failed_call_is_recorded_once_with_an_error(tmp_path, monkeypatch) -> None:
     class Boom:
         def query(self, **kwargs):

@@ -22,6 +22,8 @@ def make_config(corpus_dir: Path, pinecone_api_key: str = "") -> Config:
         embed_model="text-embedding-3-small",
         embed_dim=1536,
         top_k=8,
+        retrieve_pool=16,
+        max_chunks_per_doc=2,
         retrieve_floor=0.20,
         max_query_chars=4000,
     )

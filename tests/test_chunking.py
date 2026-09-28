@@ -5,11 +5,9 @@ from pathlib import Path
 import pytest
 
 from mka.chunking import (
-    MAX_METADATA_BYTES,
     ChunkError,
     _Piece,
     _fit_size,
-    attach_warnings,
     chunk_document,
 )
 from mka.types import ManifestRow
@@ -86,37 +84,6 @@ def test_metadata_starts_with_an_empty_warning_cache() -> None:
     assert meta["warning_text"] == ""
     assert meta["warning_excerpts"] == []
     assert meta["warning_audiences"] == []
-
-
-def test_attach_warnings_copies_the_file_pass_onto_a_chunk() -> None:
-    chunk = chunk_document(_row(), QA_DOC)[0]
-    rows = [("Never exceed 2,100 psi.", "all"), ("Quote 8 weeks.", "sales")]
-    assert attach_warnings(chunk, rows) is True
-    assert chunk.metadata["warnings_cached"] is True
-    assert chunk.metadata["contains_warning"] is True
-    assert chunk.metadata["warning_excerpts"] == [
-        "Never exceed 2,100 psi.",
-        "Quote 8 weeks.",
-    ]
-    assert chunk.metadata["warning_audiences"] == ["all", "sales"]
-    # The raw join keeps every excerpt a verbatim substring for the receipt.
-    for text, _ in rows:
-        assert text in chunk.metadata["warning_text"]
-
-
-def test_attach_warnings_marks_a_file_with_no_hazards_as_cached() -> None:
-    chunk = chunk_document(_row(), QA_DOC)[0]
-    assert attach_warnings(chunk, []) is True
-    assert chunk.metadata["warnings_cached"] is True
-    assert chunk.metadata["contains_warning"] is False
-
-
-def test_attach_warnings_leaves_the_record_alone_when_it_will_not_fit() -> None:
-    chunk = chunk_document(_row(), QA_DOC)[0]
-    before = dict(chunk.metadata)
-    assert attach_warnings(chunk, [("x" * MAX_METADATA_BYTES, "all")]) is False
-    assert chunk.metadata == before
-    assert chunk.metadata["warnings_cached"] is False
 
 
 def test_qa_shape_drops_preamble_and_numbers_questions() -> None:

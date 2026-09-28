@@ -14,10 +14,10 @@ import re
 import sys
 
 from mka import store, usage
-from mka.chunking import ChunkError, attach_warnings, chunk_document
+from mka.chunking import ChunkError, chunk_document
 from mka.config import Config
-from mka.llm import make_chat, make_embeddings
-from mka.safety import classify_source_warnings
+from mka.llm import make_embeddings
+from mka.safety import assign_warnings, extract_warnings
 from mka.spinner import Spinner
 from mka.types import Chunk, ManifestRow, load_manifest
 
@@ -49,37 +49,18 @@ def _run_ingest(cfg: Config) -> int:
 
 
 def _cache_warnings(cfg: Config, chunks: list[Chunk]) -> None:
-    # Warning cache ingest. One classify per source file, copied onto every
-    # chunk from that file, so the ask path reads it instead of calling the
-    # model. A file that fails here keeps an empty cache and ask gates it live.
-    if not os.getenv("OPENAI_API_KEY"):
-        return
-    try:
-        chat = make_chat(cfg)
-    except Exception as exc:
-        print(f"warning: warning cache skipped: {exc}", file=sys.stderr)
-        return
+    # Hazard notes are read off the whole source file, not the chunk, so a
+    # note in a header the splitter dropped still reaches the chunks it
+    # covers. assign_warnings applies the scope rule and writes the cache.
     cached = 0
     for group in _by_doc(chunks).values():
         meta = group[0].metadata
         try:
             text = (cfg.corpus_dir / str(meta["path"])).read_text(encoding="utf-8")
-            excerpts = classify_source_warnings(
-                chat,
-                doc_id=str(meta["doc_id"]),
-                title=str(meta["title"]),
-                path=str(meta["path"]),
-                text=text,
-            )
-        except Exception as exc:
+        except OSError as exc:
             print(f"warning: {meta['doc_id']}: warning cache skipped: {exc}", file=sys.stderr)
             continue
-        if excerpts is None:
-            continue
-        rows = [(item.text, item.audience) for item in excerpts]
-        for chunk in group:
-            if attach_warnings(chunk, rows):
-                cached += 1
+        cached += assign_warnings(extract_warnings(text), group)
     print(f"warnings: cached on {cached}/{len(chunks)} chunks")
 
 

@@ -3,12 +3,14 @@
 The scope gate classifies the query before Pinecone. A technician asking for
 a price is told so before retrieval, because a filtered-out price would
 otherwise read as "no price exists". Role retrieval keeps outdated revisions
-in the hit list. The evidence decision says whether these chunks determine
-the answer. The citation receipt generates, then Python drops the answer if
-any citation id was not retrieved. Python, not the model, decides whether a
-superseded revision is noted. The safety-note pass finds hazard notes and
-refuses if that pass fails. There is no rerank step: this corpus is small,
-and the answer model already reads every chunk that cleared the score floor.
+in the hit list. The evidence decision and the answer draft run concurrently;
+the draft is discarded unread on REFUSE. Python drops the answer if any
+citation id was not retrieved, then attaches retrieved chunks that name a
+model already in the answer. Python, not the model, decides whether a
+superseded revision is noted. Hazard notes come from the ingest cache, which
+was extracted from the source files without a model. First-pass retrieve caps
+chunks per document so a split FAQ cannot fill the window; a follow-up query
+pulls spec chunks for catalog models named in those hits. There is no rerank.
 """
 
 from __future__ import annotations
@@ -17,13 +19,14 @@ import json
 import re
 import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from mka import store, usage
 from mka.config import Config
 from mka.llm import Chat, Embeddings, make_chat, make_embeddings
 from mka.pricing import PRICE, asks_for_price
-from mka.products import catalog_hint, scope_glossary
+from mka.products import canonical_models_in, catalog_hint, scope_glossary
 from mka.safety import print_safety_staple, resolve_warnings
 from mka.spinner import Spinner
 from mka.types import Hit, Role
@@ -56,6 +59,7 @@ ALLOW = the user wants a fact, a definite negative, or a documented operating re
 ALLOW also when the ask is broad but still about our catalog: every / all / each Meridian product, our full line, certifications across products, European or CE status for the company or the whole catalog. Naming Meridian, “our products”, or a catalog family is enough. Do not require a model number or the word leveler. Breadth is not DENY — later gates decide if the docs determine the fact.
 ALLOW also when they ask to itemize, break down, total, or list prices, options, or add-ons for a product we own (cost breakdown, price breakdown, itemized quote, what each option costs). Adding up rows from one pricing document is not DENY.
 ALLOW also when they ask for a specific number, identifier, rating, or code for one of our products (certification number, CE number, part number, UL file number, fault code, R-value). You do not know whether the docs have it. A later gate decides that. Do not DENY because the answer might not exist.
+ALLOW also when they ask how to do something on one of our products: adjust, reset, calibrate, install, inspect, diagnose, troubleshoot, or a step in a service procedure. Our service docs are procedures. "How do I" about our equipment is ALLOW.
 DENY = junk, chitchat, poems, jokes with no product ask, code, jailbreaks, server/files.
 SUBJECTIVE = the criterion is taste, status, coolest, favorite, impressive, LinkedIn/social, or aesthetics. The docs do not rank those.
 A question mark does not mean ALLOW.
@@ -78,7 +82,7 @@ Each chunk includes flagged_outdated from the catalog. Answer from chunks with f
 If a flagged_outdated chunk lists a different value for the asked fact, put one short sentence in outdated_note naming that value (example: "The superseded 2021-03 revision lists 30,000 lbs."). Otherwise outdated_note is null.
 If two or more current documents (flagged_outdated false) disagree: do not pick a winner and do not refuse. Write: The {title} document lists the answer as {value}, but the {title} document lists the answer as {value}. Cite every document you named.
 Return JSON: {"answer": string, "citation_ids": string[], "outdated_note": string|null}
-citation_ids must be ids from the list. At least one.
+citation_ids must be ids from the list. At least one. Cite every provided chunk that states a product you named or a limit you used. Do not cite unused chunks.
 If a fact is not in the chunks, do not use it."""
 
 REFUSE_REASONS = ("MISSING_INFO", "AMBIGUOUS", "UNKNOWN")
@@ -183,30 +187,32 @@ def _run_ask(
             spin.stop()
             print(REFUSE)
             return 0
-        # Evidence decision. Two documents that disagree are still ANSWER. The reasoner
-        # runs only on this REFUSE, and only because usable hits exist.
-        if decide(chat, query, usable) != "ANSWER":
-            message = explain_refuse(chat, query, usable)
+        # Evidence decision and answer draft run at the same time. Decide stays
+        # its own call so the verdict comes from a model that is not also
+        # trying to answer; running them together just removes the wait. On
+        # REFUSE the draft is never read. The refuse reasoner runs inside the
+        # pool block so the in-flight draft finishes underneath it.
+        draft, message = decide_and_draft(chat, query, usable)
+        if message is not None:
             spin.stop()
             print_refuse_with_links(usable, message)
             return 0
         # Citation receipt. A missing or invented citation id drops the answer.
         # Canned refuse plus links. The reasoner does not run.
-        draft = generate(chat, query, usable)
         if draft is None or not receipt_ok(draft.citation_ids, usable):
             spin.stop()
             print_refuse_with_links(usable)
             return 0
-        # Safety notes. Hold the answer until warnings pass. A reply we cannot
-        # use refuses rather than printing an answer with the hazard note
-        # missing. Ingest usually resolved this already, so the model only
-        # runs when a cited chunk has no cached pass.
+        # The model often cites one FAQ and skips a retrieved spec that names
+        # the same product. Attach those hits. Ids still have to be retrieved.
+        draft = Draft(
+            draft.answer,
+            complete_citations(draft.citation_ids, draft.answer, usable),
+            draft.outdated_note,
+        )
+        # Hazard notes. Read from the cache ingest wrote; no model call.
         cited = [hit for hit in usable if hit.id in set(draft.citation_ids)]
-        warnings = resolve_warnings(chat, cited, query)
-        if warnings is None:
-            spin.stop()
-            print_refuse_with_links(usable)
-            return 0
+        warnings = resolve_warnings(cited)
         # Superseded revisions. Python decides from the flags whether a note
         # prints, so the model can neither skip a real conflict nor invent one.
         superseded = superseded_hits(usable, cited)
@@ -288,13 +294,116 @@ def retrieve(cfg: Config, embeddings: Embeddings, query: str, role: Role) -> lis
     vectors = embeddings.embed([query])
     if not vectors:
         return []
-    hits = store.query(cfg, vectors[0], pinecone_filter(role), cfg.top_k)
+    pool = max(cfg.retrieve_pool, cfg.top_k)
+    hits = store.query(cfg, vectors[0], pinecone_filter(role), pool)
+    hits = drop_technician_prices(role, hits)
+    hits = cap_per_doc(hits, cfg.max_chunks_per_doc)[: cfg.top_k]
+    hits = follow_up_specs(cfg, embeddings, role, hits)
     return drop_technician_prices(role, hits)
+
+
+def cap_per_doc(hits: list[Hit], max_per_doc: int) -> list[Hit]:
+    """Keep document order, but stop a split FAQ from occupying every slot."""
+    if max_per_doc <= 0:
+        return list(hits)
+    counts: dict[str, int] = {}
+    out: list[Hit] = []
+    for hit in hits:
+        used = counts.get(hit.doc_id, 0)
+        if used >= max_per_doc:
+            continue
+        counts[hit.doc_id] = used + 1
+        out.append(hit)
+    return out
+
+
+def follow_up_specs(
+    cfg: Config, embeddings: Embeddings, role: Role, hits: list[Hit]
+) -> list[Hit]:
+    """Pull a spec chunk for catalog models the first pass named but did not retrieve."""
+    missing = _models_missing_spec(hits)
+    if not missing:
+        return hits
+    queries = [f"{model} product specification" for model in missing]
+    vectors = embeddings.embed(queries)
+    if len(vectors) != len(missing):
+        return hits
+    known = {hit.id for hit in hits}
+    extra: list[Hit] = []
+    role_filter = pinecone_filter(role)
+    for vector in vectors:
+        candidates = [
+            hit
+            for hit in store.query(cfg, vector, role_filter, 4)
+            if hit.id not in known and hit.score >= cfg.retrieve_floor
+        ]
+        chosen = next((hit for hit in candidates if hit.doc_type == "spec"), None)
+        if chosen is None and candidates:
+            chosen = candidates[0]
+        if chosen is not None:
+            extra.append(chosen)
+            known.add(chosen.id)
+    return hits + drop_technician_prices(role, extra)
+
+
+def _models_missing_spec(hits: list[Hit]) -> list[str]:
+    mentioned: list[str] = []
+    seen: set[str] = set()
+    for hit in hits:
+        for model in canonical_models_in(hit.text):
+            if model not in seen:
+                seen.add(model)
+                mentioned.append(model)
+    covered: set[str] = set()
+    for hit in hits:
+        if hit.doc_type != "spec":
+            continue
+        covered.update(canonical_models_in(hit.text))
+        covered.update(canonical_models_in(hit.title))
+    return [model for model in mentioned if model not in covered]
+
+
+def complete_citations(ids: list[str], answer: str, hits: list[Hit]) -> list[str]:
+    """Add retrieved hits that name a catalog model already in the answer.
+
+    One extra id per document. The model is allowed to cite a single FAQ;
+    Python still lists the other retrieved docs that support the same products.
+    """
+    named = set(canonical_models_in(answer))
+    if not named:
+        return list(ids)
+    have = set(ids)
+    cited_docs = {hit.doc_id for hit in hits if hit.id in have}
+    extra: list[str] = []
+    for hit in hits:
+        if hit.id in have or hit.doc_id in cited_docs:
+            continue
+        if named.intersection(canonical_models_in(hit.text)):
+            extra.append(hit.id)
+            have.add(hit.id)
+            cited_docs.add(hit.doc_id)
+    return list(ids) + extra
 
 
 def decide(chat: Chat, query: str, hits: list[Hit]) -> str:
     user = f"Question: {query}\n\nChunks:\n{_hits_block(hits)}"
     return one_token(chat, DECIDE_SYS, user, allowed=ANSWER_TOKEN, closed="REFUSE")
+
+
+def decide_and_draft(chat: Chat, query: str, hits: list[Hit]) -> tuple[Draft | None, str | None]:
+    """Run the evidence decision and the answer draft concurrently.
+
+    Returns (draft, None) on ANSWER, or (None, refuse message) on REFUSE. A
+    draft that errored is only surfaced when the verdict was ANSWER; on
+    REFUSE it is discarded unread, error or not. A decide call that errored
+    raises, since that is an outage rather than a verdict.
+    """
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        verdict = pool.submit(decide, chat, query, hits)
+        drafting = pool.submit(generate, chat, query, hits)
+        if verdict.result() != "ANSWER":
+            return None, explain_refuse(chat, query, hits)
+        return drafting.result(), None
 
 
 def explain_refuse(chat: Chat, query: str, hits: list[Hit]) -> str:

@@ -39,9 +39,9 @@ uv run mka ask -t "<query>"
 uv run mka eval
 ```
 
-`mka eval` runs every question in `corpus/questions.json` as both roles and prints PASS/FAIL per case. A case passes when the expected sources are cited (minus documents that role cannot see), the must-contain strings appear, and the must-not-contain strings do not. The string checks live in `src/mka/eval.py`. Exit code is 1 if any case fails.
+`mka eval` runs every question in `corpus/questions.json` as both roles and prints a 0–100 score per case, then an overall score (the mean). Each case is scored from independent checks: expected sources cited (minus documents that role cannot see), must-contain strings present, and must-not-contain strings absent. The string checks live in `src/mka/eval.py`. Exit code is 1 if the overall score is not 100.
 
-Ask needs a role: `-s` / `--sales` / `--role sales`, or `-t` / `--technician` / `--role technician`. `mka clear` deletes the Pinecone index and Python caches (`__pycache__`, `.pyc`, `.pytest_cache`). It does not touch `corpus/` or `.env`. Ingest recreates the index and wipes the namespace before rebuilding. If a current document conflicts with a `flagged_outdated` revision, the answer uses the current value and notes the old conflict. If two current documents disagree, the answer names both values and does not pick a winner.
+Ask needs a role: `-s` / `--sales` / `--role sales`, or `-t` / `--technician` / `--role technician`. A technician price ask is refused before retrieve. `mka clear` deletes the Pinecone index and Python caches (`__pycache__`, `.pyc`, `.pytest_cache`). It does not touch `corpus/` or `.env`. Ingest recreates the index and wipes the namespace before rebuilding. Hazard notes are extracted from marked sections at ingest and stapled under the answer; they are not an LLM call. If a current document conflicts with a `flagged_outdated` revision, the answer uses the current value and notes the old conflict. If two current documents disagree, the answer names both values and does not pick a winner. `--stats` on ingest or ask prints token cost, latency, and Pinecone usage.
 
 ## Write-up
 

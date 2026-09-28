@@ -47,8 +47,8 @@ class Hit:
     flagged_outdated: bool
     contains_warning: bool
     warning_text: str
-    # Check 5 cache. warnings_cached false means ingest never classified this
-    # file, so ask runs the live pass for the whole cited set.
+    # Hazard-note cache written by ingest. warnings_cached false means this
+    # record predates the cache, so ask extracts from the chunk text instead.
     warnings_cached: bool = False
     warning_excerpts: tuple[str, ...] = ()
     warning_audiences: tuple[str, ...] = ()

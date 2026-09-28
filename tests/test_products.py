@@ -8,6 +8,7 @@ import pytest
 from mka.products import (
     CATALOG_PATH,
     FAMILIES,
+    canonical_models_in,
     catalog_hint,
     load_catalog,
     match_product_terms,
@@ -102,6 +103,16 @@ def test_hint_only_when_matched() -> None:
     assert hinted.startswith(query)
     assert "leveler → dock leveler" in hinted
     assert catalog_hint("Tell me a joke") == "Tell me a joke"
+
+
+def test_canonical_models_in_ignores_family_synonyms() -> None:
+    assert canonical_models_in("Which leveler for a freezer?") == []
+    assert set(canonical_models_in("Pair MD-9000 with ThermaGuard 600 and RapidRoll 400")) == {
+        "MD-9000",
+        "ThermaGuard 600",
+        "RapidRoll 400",
+    }
+    assert canonical_models_in("md9000 capacity") == ["MD-9000"]
 
 
 def test_glossary_lists_families() -> None:

@@ -81,20 +81,40 @@ def upsert(cfg: Config, vectors: list[Chunk], embeddings: list[list[float]]) -> 
 
 
 def query(cfg: Config, vector: list[float], filter: dict, top_k: int) -> list[Hit]:
-    with _timed("query", namespace=cfg.pinecone_namespace, top_k=top_k) as detail:
-        response = _index(cfg).query(
-            vector=vector,
-            filter=filter,
-            top_k=top_k,
-            include_metadata=True,
-            namespace=cfg.pinecone_namespace,
-        )
-        hits = [_hit(match) for match in response.matches]
-        detail["matches"] = len(hits)
-        read_units = usage.lookup(usage.lookup(response, "usage"), "read_units")
-        if read_units is not None:
-            detail["read_units"] = read_units
-        return hits
+    try:
+        with _timed("query", namespace=cfg.pinecone_namespace, top_k=top_k) as detail:
+            response = _index(cfg).query(
+                vector=vector,
+                filter=filter,
+                top_k=top_k,
+                include_metadata=True,
+                namespace=cfg.pinecone_namespace,
+            )
+            hits = [_hit(match) for match in response.matches]
+            detail["matches"] = len(hits)
+            read_units = usage.lookup(usage.lookup(response, "usage"), "read_units")
+            if read_units is not None:
+                detail["read_units"] = read_units
+            return hits
+    except Exception as exc:
+        _raise_missing_index(cfg, exc)
+        raise
+
+
+def _missing_index(exc: Exception, name: str) -> bool:
+    text = str(exc)
+    lowered = text.lower()
+    return name.lower() in lowered and (
+        "404" in text or "not_found" in lowered or "not found" in lowered
+    )
+
+
+def _raise_missing_index(cfg: Config, exc: Exception) -> None:
+    if _missing_index(exc, cfg.pinecone_index):
+        raise RuntimeError(
+            f"Pinecone index {cfg.pinecone_index!r} does not exist. "
+            "Run `mka ingest` to create it and load the corpus."
+        ) from exc
 
 
 def _hit(match: object) -> Hit:

@@ -1,60 +1,43 @@
-"""Hazard notes on the chunks the answer actually cited.
+"""Hazard notes stapled under the answer.
 
-The model proposes verbatim excerpts. Python keeps an excerpt only when it
-is a contiguous substring of that chunk, then drops catalog "Safety
-features" lists. Explicit "For sales" / "For technicians" wording sets the
-audience; the model's audience label is not used. If every proposed excerpt
-fails the substring check, the answer is refused. Zero real warnings is a
-clean pass, and the answer prints with no staple.
+Hazards in these documents are marked, so no model decides what one is. A
+note is one of: a hazard section (``## Safety limits``, ``## Critical
+rules``, ``## What NOT to do``, DANGER / WARNING / CAUTION), an admonition
+blockquote (``> ⚠ DANGER``), a role-directed section (``## Notes for field
+sales``), or a header line that restricts distribution (``**Audience:** Sales
+team only — do not share``). Catalog lists under ``## Safety features`` are
+specs, not hazards, and never match. Each note is stored verbatim.
+
+Scope rule. A note that appears inside a chunk's own body (one FAQ answer,
+one symptom section) belongs to that chunk only. A note that appears in no
+chunk sits in the document's shared header or footer, which the splitter
+dropped, and belongs to every chunk of that document. Service pieces carry
+the shared preamble, so a DANGER block above the first issue is found in
+every piece and lands on every piece.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 
-from mka.llm import Chat
-from mka.types import Hit
+from mka.chunking import over_limit
+from mka.types import Chunk, Hit
 
-WARN_SYS = """Find hazard warnings in these chunks, not product specs.
-Include only DANGER, WARNING, CAUTION, Critical rules, Safety limits,
-What NOT to do, lockout/tagout, never-exceed limits, and Notes that are
-themselves warnings (including role-directed notes such as For sales).
-Exclude catalog lists: "## Safety features", "## Safety", toe guards,
-velocity fuses, night locks, maintenance struts, photo-eyes listed as
-equipment, and any other feature/spec bullets. Those are specs, not warnings.
-Return excerpts: [] for a specification chunk.
-Do not copy a feature list because the heading says Safety.
-Do not skip a real hazard warning on a cited procedure.
-Reply JSON only:
-{"warnings":[{"id": chunk_id, "excerpts":[{"text":"verbatim from the chunk","audience":"all"}]}]}
-audience is all (default), sales, or technician.
-Use sales when the note or its heading says For sales, Notes for field sales, or sales only.
-Use technician when the note or its heading says For technicians or technician only.
-Otherwise audience is all.
-Copy excerpts exactly. Do not summarize.
-If a chunk has no hazard warnings, return excerpts: []."""
-
-_SPEC_HEADING = re.compile(
-    r"^(?:safety features|safety|features|standard features|safety equipment)$",
+_HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.M)
+_HAZARD_HEADING = re.compile(
+    r"^(?:safety limits?|critical rules?|what not to do|danger|warning|caution|"
+    r"hazards?|safety (?:rules|notes|precautions)|lockout)\b",
     re.I,
 )
-_WARNING_HEADING = re.compile(
-    r"^(?:safety limits|critical rules|what not to do|danger|warning|caution)\b",
-    re.I,
+_SALES = re.compile(r"\b(?:notes?\s+for\s+(?:field\s+)?sales|for\s+sales|sales(?:\s+team)?\s+only)\b", re.I)
+_TECH = re.compile(r"\b(?:for\s+technicians?|technicians?\s+only)\b", re.I)
+_ADMONITION_FIRST_LINE = re.compile(r"^>.*\b(?:DANGER|WARNING|CAUTION)\b", re.M)
+_RESTRICTION_LINE = re.compile(
+    r"^\*\*(?:Audience|Classification):\*\*.*\b(?:do not (?:share|distribute)|without approval)\b.*$",
+    re.I | re.M,
 )
-
-_HEADING = re.compile(r"^#{1,6}\s+(.+)$", re.M)
-_SALES_NOTE = re.compile(
-    r"\b(?:for\s+(?:field\s+)?sales|notes?\s+for\s+(?:field\s+)?sales|"
-    r"field\s+sales|sales\s+only)\b",
-    re.I,
-)
-_TECH_NOTE = re.compile(
-    r"\b(?:for\s+technicians?|technician\s+only|techs?\s+only)\b",
-    re.I,
-)
+_RULE = re.compile(r"^---[ \t]*$", re.M)
 
 
 @dataclass(frozen=True)
@@ -63,186 +46,142 @@ class WarningExcerpt:
     audience: str
 
 
-def excerpt_in_source(excerpt: str, hit: Hit) -> bool:
-    # warning_text is empty at ingest. It is included so a cached excerpt
-    # still has to be verbatim from this record, not a paraphrase.
-    blob = hit.text + "\n" + (hit.warning_text or "")
-    return bool(excerpt) and excerpt in blob
+def extract_warnings(text: str) -> list[WarningExcerpt]:
+    """Every marked hazard or handling note in a source text, verbatim, in order."""
+    found: list[tuple[int, WarningExcerpt]] = []
+    found += _sections(text)
+    found += _admonitions(text)
+    found += _restriction_lines(text)
+    found.sort(key=lambda item: item[0])
+    out: list[WarningExcerpt] = []
+    seen: set[str] = set()
+    for _start, excerpt in found:
+        if excerpt.text not in seen:
+            seen.add(excerpt.text)
+            out.append(excerpt)
+    return out
 
 
-def heading_before(excerpt: str, text: str) -> str:
-    idx = text.find(excerpt)
-    if idx < 0:
-        return ""
-    headings = _HEADING.findall(text[:idx])
-    return headings[-1].strip() if headings else ""
+def _sections(text: str) -> list[tuple[int, WarningExcerpt]]:
+    headings = list(_HEADING.finditer(text))
+    out: list[tuple[int, WarningExcerpt]] = []
+    for i, match in enumerate(headings):
+        level, title = len(match.group(1)), match.group(2)
+        audience = _audience(title)
+        if not (_HAZARD_HEADING.match(title) or audience != "all"):
+            continue
+        start = match.end()
+        end = len(text)
+        for later in headings[i + 1 :]:
+            if len(later.group(1)) <= level:
+                end = later.start()
+                break
+        rule = _RULE.search(text, start, end)
+        if rule:
+            end = rule.start()
+        body = text[start:end].strip()
+        if body:
+            out.append((start, WarningExcerpt(body, audience)))
+    return out
 
 
-def infer_audience(excerpt: str, hit: Hit) -> str:
-    # The heading or the note itself wins over whatever audience the model
-    # returned. classify_warnings discards that label and calls this.
-    heading = heading_before(excerpt, hit.text)
-    if not heading and hit.warning_text:
-        heading = heading_before(excerpt, hit.warning_text)
-    probe = f"{heading}\n{excerpt}"
-    if _SALES_NOTE.search(probe):
+def _admonitions(text: str) -> list[tuple[int, WarningExcerpt]]:
+    out: list[tuple[int, WarningExcerpt]] = []
+    for match in _ADMONITION_FIRST_LINE.finditer(text):
+        start = match.start()
+        end = start
+        for line in text[start:].splitlines(keepends=True):
+            if not line.startswith(">"):
+                break
+            end += len(line)
+        block = text[start:end].strip()
+        out.append((start, WarningExcerpt(block, _audience(block))))
+    return out
+
+
+def _restriction_lines(text: str) -> list[tuple[int, WarningExcerpt]]:
+    return [
+        (match.start(), WarningExcerpt(match.group(0).strip(), _audience(match.group(0))))
+        for match in _RESTRICTION_LINE.finditer(text)
+    ]
+
+
+def _audience(probe: str) -> str:
+    if _SALES.search(probe):
         return "sales"
-    if _TECH_NOTE.search(probe):
+    if _TECH.search(probe):
         return "technician"
     return "all"
 
 
-def excerpt_visible(audience: str, role: str) -> bool:
-    return audience == "all" or audience == role
+def assign_warnings(excerpts: list[WarningExcerpt], chunks: list[Chunk]) -> int:
+    """Copy one file's notes onto its chunks by the scope rule. Returns chunks cached."""
+    rows: dict[str, list[tuple[str, str]]] = {chunk.id: [] for chunk in chunks}
+    for excerpt in excerpts:
+        homes = [chunk for chunk in chunks if excerpt.text in chunk.text]
+        for chunk in homes or chunks:
+            rows[chunk.id].append((excerpt.text, excerpt.audience))
+    return sum(attach_warnings(chunk, rows[chunk.id]) for chunk in chunks)
 
 
-def is_catalog_spec(excerpt: str, hit: Hit) -> bool:
-    # "## Safety" on a spec is a parts list (toe guards, photo-eyes).
-    # "## Safety limits" on a procedure is a hazard. The heading decides.
-    # A real warning heading short-circuits so a spec heading elsewhere
-    # in the excerpt cannot hide it.
-    heading = heading_before(excerpt, hit.text)
-    if not heading and hit.warning_text:
-        heading = heading_before(excerpt, hit.warning_text)
-    inner = [part.strip() for part in _HEADING.findall(excerpt)]
-    for candidate in (heading, *inner):
-        if not candidate:
-            continue
-        if _WARNING_HEADING.match(candidate):
-            return False
-        if _SPEC_HEADING.match(candidate):
-            return True
-    return False
+def attach_warnings(chunk: Chunk, rows: list[tuple[str, str]]) -> bool:
+    """Store (excerpt, audience) rows on a record. False leaves it untouched.
 
-
-def classify_warnings(
-    chat: Chat, cited: list[Hit], query: str = ""
-) -> list[tuple[Hit, list[WarningExcerpt]]] | None:
-    user = json.dumps(
-        {
-            "query": query,
-            "chunks": [
-                {
-                    "id": hit.id,
-                    "title": hit.title,
-                    "path": hit.path,
-                    "text": hit.text,
-                    "warning_text": hit.warning_text,
-                }
-                for hit in cited
-            ]
-        },
-        ensure_ascii=False,
-    )
-    raw = chat.complete(system=WARN_SYS, user=user, json_object=True)
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    rows = data.get("warnings", [])
-    if not isinstance(rows, list):
-        return None
-    by_id = {hit.id: hit for hit in cited}
-    out: list[tuple[Hit, list[WarningExcerpt]]] = []
-    in_source = 0
-    missed = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            return None
-        hit = by_id.get(row.get("id"))
-        if hit is None:
-            return None
-        accepted: list[WarningExcerpt] = []
-        excerpts = row.get("excerpts") or []
-        if not isinstance(excerpts, list):
-            return None
-        for item in excerpts:
-            parsed = _parse_excerpt(item)
-            if parsed is None:
-                return None
-            text, _audience = parsed
-            if not excerpt_in_source(text, hit):
-                missed += 1
-                continue
-            in_source += 1
-            # Quoted from the chunk, but it is a feature list. Drop it.
-            # An empty result after this drop is still a pass.
-            if is_catalog_spec(text, hit):
-                continue
-            accepted.append(
-                WarningExcerpt(text=text, audience=infer_audience(text, hit))
-            )
-        out.append((hit, accepted))
-    # The model claimed warnings and none of them appear in the chunk.
-    # That is not "no warnings." Refuse the answer.
-    if missed and in_source == 0:
-        return None
-    return out
-
-
-def classify_source_warnings(
-    chat: Chat, *, doc_id: str, title: str, path: str, text: str
-) -> list[WarningExcerpt] | None:
-    """Ingest pass. Classify a whole source file once, before it is chunked.
-
-    The file still carries the headings a later split can strip, so the
-    audience resolved here is better grounded than one inferred from a lone
-    chunk. Same prompt and same Python verification as the ask-time pass.
-    None is a classifier error: leave the cache empty and let ask gate it.
+    warning_text is the raw join so excerpt_in_source still sees a verbatim
+    substring for a header note the chunk body does not contain.
     """
-    whole = Hit(
-        id=doc_id,
-        score=1.0,
-        text=text,
-        title=title,
-        path=path,
-        doc_id=doc_id,
-        model="",
-        doc_type="",
-        flagged_outdated=False,
-        contains_warning=False,
-        warning_text="",
+    saved = dict(chunk.metadata)
+    chunk.metadata.update(
+        {
+            "contains_warning": bool(rows),
+            "warning_text": "\n\n".join(text for text, _ in rows),
+            "warnings_cached": True,
+            "warning_excerpts": [text for text, _ in rows],
+            "warning_audiences": [audience for _, audience in rows],
+        }
     )
-    out = classify_warnings(chat, [whole])
-    if out is None:
-        return None
-    # No rows at all is a file with nothing to warn about, not a failure.
-    return out[0][1] if out else []
+    if over_limit(chunk):
+        chunk.metadata.clear()
+        chunk.metadata.update(saved)
+        return False
+    return True
+
+
+def excerpt_in_source(excerpt: str, hit: Hit) -> bool:
+    blob = hit.text + "\n" + (hit.warning_text or "")
+    return bool(excerpt) and excerpt in blob
 
 
 def cached_warnings(cited: list[Hit]) -> list[tuple[Hit, list[WarningExcerpt]]] | None:
-    """Rebuild Check 5 from the ingest cache, with no model call.
-
-    None means the cache does not cover this set and the live pass has to
-    run. Every excerpt is still checked against the record it rides on, so a
-    vector that drifted from its cache falls back instead of printing a note
-    nothing verified.
-    """
+    """Notes from the ingest cache. None if any cited record was not cached
+    or its cache no longer matches the record."""
     out: list[tuple[Hit, list[WarningExcerpt]]] = []
     for hit in cited:
         if not hit.warnings_cached:
             return None
         if len(hit.warning_excerpts) != len(hit.warning_audiences):
             return None
-        accepted: list[WarningExcerpt] = []
+        rows: list[WarningExcerpt] = []
         for text, audience in zip(hit.warning_excerpts, hit.warning_audiences):
             if not excerpt_in_source(text, hit):
                 return None
-            accepted.append(WarningExcerpt(text=text, audience=audience))
-        out.append((hit, accepted))
+            rows.append(WarningExcerpt(text, audience))
+        out.append((hit, rows))
     return out
 
 
-def resolve_warnings(
-    chat: Chat, cited: list[Hit], query: str = ""
-) -> list[tuple[Hit, list[WarningExcerpt]]] | None:
-    """Check 5. The ingest cache when it covers every cited chunk, else the model."""
+def resolve_warnings(cited: list[Hit]) -> list[tuple[Hit, list[WarningExcerpt]]]:
+    """The ingest cache when it covers every cited record, else extract from
+    each record's own text. The fallback cannot see a header note the
+    splitter dropped; re-running ingest restores it."""
     cached = cached_warnings(cited)
     if cached is not None:
         return cached
-    return classify_warnings(chat, cited, query)
+    return [(hit, extract_warnings(hit.text)) for hit in cited]
+
+
+def excerpt_visible(audience: str, role: str) -> bool:
+    return audience == "all" or audience == role
 
 
 def print_safety_staple(
@@ -261,28 +200,8 @@ def print_safety_staple(
             unique.append(item.text)
         if not unique:
             continue
-        print(
-            f"⚠ WARNING — {hit.title} ({hit.path}). "
-        )
+        print(f"⚠ WARNING — {hit.title} ({hit.path}).")
         print()
         for excerpt in unique:
             print(excerpt)
             print()
-
-
-def _parse_excerpt(item: object) -> tuple[str, str | None] | None:
-    if isinstance(item, str):
-        return item, None
-    if not isinstance(item, dict):
-        return None
-    text = item.get("text")
-    if text is None:
-        text = item.get("excerpt")
-    if not isinstance(text, str):
-        return None
-    audience = item.get("audience")
-    if audience is not None and not isinstance(audience, str):
-        return None
-    return text, audience
-
-
