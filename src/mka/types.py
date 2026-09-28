@@ -1,3 +1,9 @@
+"""The fixed set of manifest fields I copy onto every vector.
+
+flagged_outdated is stored but is never a retrieval filter. Ask reads it to
+pick the winner when an old revision and a current one disagree.
+"""
+
 from __future__ import annotations
 
 import json
@@ -38,6 +44,14 @@ class Hit:
     doc_id: str
     model: str
     doc_type: str
+    flagged_outdated: bool
+    contains_warning: bool
+    warning_text: str
+    # Hazard-note cache written by ingest. warnings_cached false means this
+    # record predates the cache, so ask extracts from the chunk text instead.
+    warnings_cached: bool = False
+    warning_excerpts: tuple[str, ...] = ()
+    warning_audiences: tuple[str, ...] = ()
 
 
 def load_manifest(corpus_dir: Path) -> list[ManifestRow]:

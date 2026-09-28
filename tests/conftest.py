@@ -9,10 +9,10 @@ from mka.config import Config
 FIXTURE_CORPUS = Path(__file__).parent / "fixtures" / "corpus"
 
 
-def make_config(corpus_dir: Path) -> Config:
+def make_config(corpus_dir: Path, pinecone_api_key: str = "") -> Config:
     return Config(
         corpus_dir=corpus_dir,
-        pinecone_api_key="",
+        pinecone_api_key=pinecone_api_key,
         pinecone_index="mka-poc",
         pinecone_cloud="aws",
         pinecone_region="us-east-1",
@@ -22,6 +22,8 @@ def make_config(corpus_dir: Path) -> Config:
         embed_model="text-embedding-3-small",
         embed_dim=1536,
         top_k=8,
+        retrieve_pool=16,
+        max_chunks_per_doc=2,
         retrieve_floor=0.20,
         max_query_chars=4000,
     )
