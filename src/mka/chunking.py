@@ -1,12 +1,4 @@
-"""Chunking on document shape, not on filename or a fixed token window.
-
-Most files stay whole as one chunk, which keeps the original context together.
-I only split the shapes that repeat: an FAQ becomes one chunk per ``## Q:``,
-and a service doc becomes one chunk per issue with the shared preamble and
-tail added back to each piece. A single procedure is never broken up. If a
-piece still runs past the embedding or metadata limit, I split it on an
-existing ``##`` or raise. Nothing is truncated.
-"""
+"""Split each document into chunks so it can be embedded and searched."""
 
 from __future__ import annotations
 

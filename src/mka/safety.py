@@ -1,20 +1,4 @@
-"""Hazard notes, pulled from the docs and printed under every answer.
-
-The docs mark their own hazards, so no model has to decide what counts as one.
-A note is a hazard section (``## Safety limits``, ``## Critical rules``,
-``## What NOT to do``, DANGER / WARNING / CAUTION), an admonition blockquote
-(``> ⚠ DANGER``), a section aimed at one role (``## Notes for field sales``),
-or a header line that limits who can see it (``**Audience:** Sales team only
-— do not share``). A catalog list under ``## Safety features`` is a spec, not
-a hazard, so it never matches. Every note is stored word for word.
-
-Scope works like this. A note inside a chunk's own body, such as one FAQ
-answer or one symptom section, belongs to that chunk alone. A note that lands
-in no chunk came from the document's shared header or footer, which the
-splitter dropped, so it belongs to every chunk of that document. Service
-pieces keep their shared preamble, which is why a DANGER block above the
-first issue ends up on all of them.
-"""
+"""Find safety warnings in the documents and print the ones that apply under the answer."""
 
 from __future__ import annotations
 

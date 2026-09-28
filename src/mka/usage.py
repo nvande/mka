@@ -1,9 +1,4 @@
-"""Token counts, latency, and Pinecone calls behind `--stats`.
-
-Nothing here runs unless that flag is set, and the answer path never reads it.
-The dollar figure is a list-price estimate for tokens only. Pinecone bills by
-read and write units, so I print those per call and don't try to price them.
-"""
+"""Record token counts, time, and vector store usage, and print them when --stats is set."""
 
 from __future__ import annotations
 

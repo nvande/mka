@@ -1,20 +1,4 @@
-"""The ask command. Gates run in order, and the first one that fails ends the request.
-
-I classify scope before touching Pinecone, and I turn down a technician's
-price question before retrieval, because a price that got filtered out reads
-exactly like a price that doesn't exist. Retrieval filters on role but keeps
-outdated revisions, so the answer can flag a conflict instead of missing it.
-The evidence check and the answer draft run at the same time to save the wait,
-and the draft is thrown away unread if the check comes back REFUSE.
-
-Python makes the calls the model shouldn't. It drops an answer that cites an
-id we never retrieved, adds back retrieved chunks for models the answer
-already names, and decides when to note a superseded revision. Safety
-warnings come from the ingest cache, which was built without a model. The
-first retrieve caps chunks per document so a split FAQ can't fill the window,
-then a second query pulls specs for any catalog model in those hits. Nothing
-retries, and there's no reranking.
-"""
+"""Answer a question from the ingested documents. The caller supplies a role, sales or technician."""
 
 from __future__ import annotations
 

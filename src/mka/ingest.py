@@ -1,11 +1,4 @@
-"""The ingest command. Read the manifest, chunk, embed, then replace the namespace.
-
-A bad manifest row fails only that file and never gets upserted. The rest of
-the corpus still loads, so one broken document doesn't block a rebuild.
-Wiping the namespace is safe here because ingest is the only writer and the
-corpus is the entire index. If a second live source ever writes to this
-index, it can't share this replace.
-"""
+"""Read the corpus, chunk the documents, embed them, and load them into the vector store."""
 
 from __future__ import annotations
 
