@@ -52,7 +52,7 @@ corpus/
 
 Only .md (markup) files are supported for this project.
 
-After you've obtained the corpus, to ingest the documents, run:
+After you've verified the corpus, to ingest the documents, run:
 
 ```sh
 uv run mka ingest
