@@ -54,7 +54,7 @@ def test_ask_short_flags_match_role(monkeypatch: pytest.MonkeyPatch) -> None:
     assert seen["role"] == "technician"
 
 
-def test_stats_flag_reaches_ask_and_ingest(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stats_flag_reaches_ask_ingest_and_eval(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, bool] = {}
 
     def fake_ask(cfg, role: str, query: str, stats: bool = False) -> int:
@@ -67,8 +67,14 @@ def test_stats_flag_reaches_ask_and_ingest(monkeypatch: pytest.MonkeyPatch) -> N
         seen["ingest"] = stats
         return 0
 
+    def fake_eval(cfg, stats: bool = False) -> int:
+        del cfg
+        seen["eval"] = stats
+        return 0
+
     monkeypatch.setattr("mka.cli.run_ask", fake_ask)
     monkeypatch.setattr("mka.cli.run_ingest", fake_ingest)
+    monkeypatch.setattr("mka.cli.run_eval", fake_eval)
     monkeypatch.setattr("mka.cli.load_config", lambda: object())
 
     with pytest.raises(SystemExit) as ask:
@@ -80,6 +86,11 @@ def test_stats_flag_reaches_ask_and_ingest(monkeypatch: pytest.MonkeyPatch) -> N
         main(["ingest", "--stats"])
     assert ingest.value.code == 0
     assert seen["ingest"] is True
+
+    with pytest.raises(SystemExit) as eval_cmd:
+        main(["eval", "--stats"])
+    assert eval_cmd.value.code == 0
+    assert seen["eval"] is True
 
 
 def test_ask_rejects_combined_role_flags() -> None:
@@ -96,7 +107,7 @@ def test_ingest_via_cli(
     with pytest.raises(SystemExit) as exc:
         main(["ingest"])
     assert exc.value.code == 0
-    assert "chunks: 2" in capsys.readouterr().out
+    assert "ingest complete: 2 chunks" in capsys.readouterr().out
 
 
 def test_ask_empty_via_cli(capsys: object) -> None:

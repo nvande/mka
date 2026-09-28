@@ -57,7 +57,7 @@ def test_run_ingest_prints_count(
 ) -> None:
     assert run_ingest(make_config(fixture_corpus)) == 0
     out = capsys.readouterr().out
-    assert "chunks: 2" in out
+    assert "ingest complete: 2 chunks" in out
     assert "--- stats ---" not in out
 
 
@@ -67,8 +67,8 @@ def test_run_ingest_stats_reports_when_no_api_calls(
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     assert run_ingest(make_config(fixture_corpus), stats=True) == 0
     out = capsys.readouterr().out
-    assert "chunks: 2" in out
-    assert out.index("chunks: 2") < out.index("--- stats ---")
+    assert "ingest complete: 2 chunks" in out
+    assert out.index("ingest complete: 2 chunks") < out.index("--- stats ---")
     assert "workflow: ingest" in out
     assert "token_cost_usd: 0.00000000" in out
     assert "pinecone_calls: 0" in out
@@ -87,7 +87,9 @@ def test_run_ingest_writes_index(fixture_corpus: Path, monkeypatch: pytest.Monke
     assert seen == [2]
 
 
-def test_invalid_audience_skips_row(tmp_path: Path, skip_index: None) -> None:
+def test_invalid_audience_skips_row(
+    tmp_path: Path, skip_index: None, capsys: object
+) -> None:
     root = _write_corpus(
         tmp_path,
         [
@@ -100,6 +102,9 @@ def test_invalid_audience_skips_row(tmp_path: Path, skip_index: None) -> None:
     assert [chunk.id for chunk in chunks] == ["good::0"]
     assert any("invalid audience" in err and "bad" in err for err in errors)
     assert run_ingest(make_config(root)) == 1
+    captured = capsys.readouterr()
+    assert "chunks: 1" in captured.out
+    assert "ingest complete" not in captured.out
 
 
 def test_invalid_version_skips_row(tmp_path: Path) -> None:
@@ -206,3 +211,4 @@ def test_missing_corpus_dir(tmp_path: Path, capsys: object) -> None:
     captured = capsys.readouterr()
     assert "corpus directory not found" in captured.err
     assert "chunks: 0" in captured.out
+    assert "ingest complete" not in captured.out

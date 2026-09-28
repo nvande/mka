@@ -1,8 +1,8 @@
-"""Token counts, latency, and Pinecone calls for `--stats`.
+"""Token counts, latency, and Pinecone calls behind `--stats`.
 
-Off unless that flag is set. The answer path never reads this. The dollar
-figure is a list-price estimate for tokens only; Pinecone bills by read and
-write units, which are shown per call and not priced here.
+Nothing here runs unless that flag is set, and the answer path never reads it.
+The dollar figure is a list-price estimate for tokens only. Pinecone bills by
+read and write units, so I print those per call and don't try to price them.
 """
 
 from __future__ import annotations

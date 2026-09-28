@@ -1,16 +1,19 @@
-"""Ask path. Gates in order, then print. A failed gate stops the request. Nothing retries.
+"""The ask command. Gates run in order, and the first one that fails ends the request.
 
-The scope gate classifies the query before Pinecone. A technician asking for
-a price is told so before retrieval, because a filtered-out price would
-otherwise read as "no price exists". Role retrieval keeps outdated revisions
-in the hit list. The evidence decision and the answer draft run concurrently;
-the draft is discarded unread on REFUSE. Python drops the answer if any
-citation id was not retrieved, then attaches retrieved chunks that name a
-model already in the answer. Python, not the model, decides whether a
-superseded revision is noted. Hazard notes come from the ingest cache, which
-was extracted from the source files without a model. First-pass retrieve caps
-chunks per document so a split FAQ cannot fill the window; a follow-up query
-pulls spec chunks for catalog models named in those hits. There is no rerank.
+I classify scope before touching Pinecone, and I turn down a technician's
+price question before retrieval, because a price that got filtered out reads
+exactly like a price that doesn't exist. Retrieval filters on role but keeps
+outdated revisions, so the answer can flag a conflict instead of missing it.
+The evidence check and the answer draft run at the same time to save the wait,
+and the draft is thrown away unread if the check comes back REFUSE.
+
+Python makes the calls the model shouldn't. It drops an answer that cites an
+id we never retrieved, adds back retrieved chunks for models the answer
+already names, and decides when to note a superseded revision. Safety
+warnings come from the ingest cache, which was built without a model. The
+first retrieve caps chunks per document so a split FAQ can't fill the window,
+then a second query pulls specs for any catalog model in those hits. Nothing
+retries, and there's no reranking.
 """
 
 from __future__ import annotations

@@ -1,19 +1,19 @@
-"""Hazard notes stapled under the answer.
+"""Hazard notes, pulled from the docs and printed under every answer.
 
-Hazards in these documents are marked, so no model decides what one is. A
-note is one of: a hazard section (``## Safety limits``, ``## Critical
-rules``, ``## What NOT to do``, DANGER / WARNING / CAUTION), an admonition
-blockquote (``> ⚠ DANGER``), a role-directed section (``## Notes for field
-sales``), or a header line that restricts distribution (``**Audience:** Sales
-team only — do not share``). Catalog lists under ``## Safety features`` are
-specs, not hazards, and never match. Each note is stored verbatim.
+The docs mark their own hazards, so no model has to decide what counts as one.
+A note is a hazard section (``## Safety limits``, ``## Critical rules``,
+``## What NOT to do``, DANGER / WARNING / CAUTION), an admonition blockquote
+(``> ⚠ DANGER``), a section aimed at one role (``## Notes for field sales``),
+or a header line that limits who can see it (``**Audience:** Sales team only
+— do not share``). A catalog list under ``## Safety features`` is a spec, not
+a hazard, so it never matches. Every note is stored word for word.
 
-Scope rule. A note that appears inside a chunk's own body (one FAQ answer,
-one symptom section) belongs to that chunk only. A note that appears in no
-chunk sits in the document's shared header or footer, which the splitter
-dropped, and belongs to every chunk of that document. Service pieces carry
-the shared preamble, so a DANGER block above the first issue is found in
-every piece and lands on every piece.
+Scope works like this. A note inside a chunk's own body, such as one FAQ
+answer or one symptom section, belongs to that chunk alone. A note that lands
+in no chunk came from the document's shared header or footer, which the
+splitter dropped, so it belongs to every chunk of that document. Service
+pieces keep their shared preamble, which is why a DANGER block above the
+first issue ends up on all of them.
 """
 
 from __future__ import annotations

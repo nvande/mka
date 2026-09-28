@@ -1,10 +1,11 @@
-"""Chunk by document shape, not by filename or a token window.
+"""Chunking on document shape, not on filename or a fixed token window.
 
-Default is one file, one chunk. Real ``## Q:`` blocks become one chunk per
-question. Repeated service issues become one chunk per issue, with the
-shared preamble and tail stapled back on. A single procedure stays whole.
-Over the embedding or metadata cap, split on an existing ``##`` or fail.
-Never truncate.
+Most files stay whole as one chunk, which keeps the original context together.
+I only split the shapes that repeat: an FAQ becomes one chunk per ``## Q:``,
+and a service doc becomes one chunk per issue with the shared preamble and
+tail added back to each piece. A single procedure is never broken up. If a
+piece still runs past the embedding or metadata limit, I split it on an
+existing ``##`` or raise. Nothing is truncated.
 """
 
 from __future__ import annotations

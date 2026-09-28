@@ -1,9 +1,10 @@
-"""Ingest. Join the manifest, chunk, embed, replace the namespace.
+"""The ingest command. Read the manifest, chunk, embed, then replace the namespace.
 
-A bad row fails that file and does not upsert it. The rest of the corpus
-still loads. The namespace wipe is safe here because this command is the
-only writer and the corpus is the whole index. A second live source must
-not share this replace.
+A bad manifest row fails only that file and never gets upserted. The rest of
+the corpus still loads, so one broken document doesn't block a rebuild.
+Wiping the namespace is safe here because ingest is the only writer and the
+corpus is the entire index. If a second live source ever writes to this
+index, it can't share this replace.
 """
 
 from __future__ import annotations
@@ -44,8 +45,11 @@ def _run_ingest(cfg: Config) -> int:
             return 1
         finally:
             spin.stop()
-    print(f"chunks: {len(chunks)}")
-    return 1 if errors else 0
+    if errors:
+        print(f"chunks: {len(chunks)}")
+        return 1
+    print(f"ingest complete: {len(chunks)} chunks")
+    return 0
 
 
 def _cache_warnings(cfg: Config, chunks: list[Chunk]) -> None:

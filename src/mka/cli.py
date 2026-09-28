@@ -19,19 +19,19 @@ def main(argv: list[str] | None = None) -> None:
     common.add_argument(
         "--stats",
         action="store_true",
-        help="Print token cost, latency, and Pinecone usage for this run",
+        help="Print token cost, latency, and Vector Store usage for this run",
     )
 
     sub.add_parser(
         "ingest",
         parents=[common],
-        help="Join the manifest, chunk, and upsert to Pinecone",
+        help="Process the corpus and upsert to Vector Store",
     )
 
     ask = sub.add_parser(
         "ask",
         parents=[common],
-        help="Ask a question against the index",
+        help="Ask a question to be answered by the Meridian Knowledge Assistant",
     )
     role = ask.add_mutually_exclusive_group(required=True)
     role.add_argument(
@@ -55,11 +55,12 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser(
         "clear",
-        help="Wipe the Pinecone index and Python caches",
+        help="Clear the Vector Store and Python caches",
     )
 
     sub.add_parser(
         "eval",
+        parents=[common],
         help="Run corpus/questions.json under both roles and print 0-100 scores",
     )
 
@@ -73,7 +74,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "clear":
         raise SystemExit(run_clear(cfg))
     if args.command == "eval":
-        raise SystemExit(run_eval(cfg))
+        raise SystemExit(run_eval(cfg, stats=args.stats))
     raise SystemExit(2)
 
 

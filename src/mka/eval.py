@@ -1,9 +1,10 @@
-"""`mka eval`: run corpus/questions.json under both roles and score the output.
+"""The eval command. Runs every question in corpus/questions.json as both roles.
 
-Each case is scored 0–100 from independent checks: expected sources cited
-(minus documents that role cannot see), must-contain strings present, and
-must-not-contain strings absent. String checks live in CHECKS. Expected
-sources come from questions.json. The final score is the mean of case scores.
+Each case gets a 0–100 score from three independent checks: the expected
+sources were cited, the must-contain strings showed up, and the
+must-not-contain strings didn't. Expected sources come from questions.json,
+minus any document that role can't see. The string checks live in CHECKS
+below. The overall score is the mean of the cases.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import re
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 
+from mka import usage
 from mka.ask import run_ask
 from mka.config import Config
 from mka.types import Role, load_manifest
@@ -54,7 +56,11 @@ class Grade:
     problems: list[str]
 
 
-def run_eval(cfg: Config) -> int:
+def run_eval(cfg: Config, *, stats: bool = False) -> int:
+    return usage.reported("eval", lambda: _run_eval(cfg), stats=stats)
+
+
+def _run_eval(cfg: Config) -> int:
     questions = json.loads((cfg.corpus_dir / "questions.json").read_text(encoding="utf-8"))
     doc_type = {row.doc_id: row.doc_type for row in load_manifest(cfg.corpus_dir)}
     grades: list[Grade] = []
@@ -119,6 +125,8 @@ def _checks_for(qid: str, role: Role) -> dict:
 
 
 def ask_capture(cfg: Config, role: Role, query: str) -> str:
+    # Leave stats off. The eval ledger already wraps the whole run; a nested
+    # --stats ask would print into this buffer and wipe the parent ledger.
     buffer = io.StringIO()
     with redirect_stdout(buffer):
         run_ask(cfg, role, query)

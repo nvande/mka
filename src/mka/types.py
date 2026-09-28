@@ -1,7 +1,7 @@
-"""Closed catalog fields copied onto each vector.
+"""The fixed set of manifest fields I copy onto every vector.
 
-flagged_outdated is stored and is not a retrieve filter. Ask uses it as
-the winner rule when an old revision and a current one disagree.
+flagged_outdated is stored but is never a retrieval filter. Ask reads it to
+pick the winner when an old revision and a current one disagree.
 """
 
 from __future__ import annotations

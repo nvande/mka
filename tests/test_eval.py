@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from mka import usage
 from mka.cli import main
 from mka.eval import cited_ids, run_eval, score_output
 
@@ -120,6 +121,7 @@ def test_eval_grades_both_roles_and_filters_hidden_sources(corpus: Path, capsys)
     assert "q6_procedural_detail [technician]  100" in out
     # five 100s and a 0 → mean 83
     assert "score: 83" in out
+    assert "--- stats ---" not in out
 
 
 def test_eval_via_cli(corpus: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -127,3 +129,42 @@ def test_eval_via_cli(corpus: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(SystemExit) as exc:
         main(["eval"])
     assert exc.value.code == 1
+
+
+def test_run_eval_stats_after_scores_and_records_nested_asks(
+    corpus: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    def fake_ask(cfg, role, query, **kwargs):
+        del cfg, kwargs
+        usage.record_chat(
+            "gpt-5.4-nano",
+            {"usage": {"prompt_tokens": 10, "completion_tokens": 5}},
+            1.0,
+        )
+        print(ANSWERS[(role, query)], end="")
+        return 0
+
+    monkeypatch.setattr("mka.eval.run_ask", fake_ask)
+    code = run_eval(make_config(corpus), stats=True)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert out.index("score: 83") < out.index("--- stats ---")
+    assert "workflow: eval" in out
+    assert "chat_calls: 6 model=gpt-5.4-nano prompt_tokens=60 completion_tokens=30" in out
+    assert "pinecone_calls: 0" in out
+    assert "latency_ms:" in out
+    # Nested ask must not print its own stats block into the score lines.
+    assert out.count("--- stats ---") == 1
+
+
+def test_eval_stats_via_cli(
+    corpus: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setenv("CORPUS_DIR", str(corpus))
+    with pytest.raises(SystemExit) as exc:
+        main(["eval", "--stats"])
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "score: 83" in out
+    assert out.index("score: 83") < out.index("--- stats ---")
+    assert "workflow: eval" in out
