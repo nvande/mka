@@ -1,4 +1,4 @@
-## AI Engineer Screening Exercise - RiteHite Hiring Process
+## AI Engineer Screening Exercise
 
 #### Completed by Nicholas Vander Woude
 
