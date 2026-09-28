@@ -41,7 +41,7 @@ Fill in `OPENAI_API_KEY` and `PINECONE_API_KEY` in `.env`.
 
 Before you can respond to queries with `mka`, you will first need to ingest the documents.
 
-Obtain the corpus and put it at `./corpus`:
+Ensure you have the correct corpus at `./corpus`:
 
 ```text
 corpus/
