@@ -1,0 +1,76 @@
+{
+  "question_set_name": "Meridian Knowledge Assistant — Evaluation Queries",
+  "question_set_version": "1.0.0",
+  "description": "Seven evaluation queries covering single-doc lookup, cross-doc synthesis, contradictory-document handling, unanswerable questions, role-scoped access, and near-miss boundary cases. Each question is tagged with the skill it tests and the documents it should (or should not) draw from.",
+  "questions": [
+    {
+      "id": "q1_simple_lookup",
+      "query": "What is the rated lifting capacity of the MD-9000 dock leveler?",
+      "tests": ["single_doc_lookup", "numeric_fact_retrieval"],
+      "expected_answer_summary": "40,000 lbs",
+      "expected_sources": ["spec_md9000"],
+      "difficulty": "easy",
+      "grading_notes": "Should cite spec_md9000 and return the exact figure. This is the baseline — a system that fails here has a fundamentally broken retrieval path."
+    },
+    {
+      "id": "q2_cross_doc_synthesis",
+      "query": "I'm designing a -10°F freezer dock with high-traffic forklift movement. What equipment should I specify and why?",
+      "tests": ["multi_doc_synthesis", "recommendation_reasoning"],
+      "expected_answer_summary": "MD-9000 air-powered leveler (no hydraulic fluid, -40°F rated) + ThermaGuard 600 insulated sectional door at exterior + optionally RapidRoll 400 as interior high-speed transition door. Should mention the air-powered choice prevents hydraulic fluid viscosity issues in cold.",
+      "expected_sources": ["spec_md9000", "spec_thermaguard600", "spec_rapidroll400", "faq_selection_guide", "faq_cold_storage"],
+      "difficulty": "medium",
+      "grading_notes": "Tests whether retrieval surfaces multiple relevant docs and the LLM can synthesize a coherent recommendation with reasoning. A system that cites only one doc here is under-retrieving."
+    },
+    {
+      "id": "q3_contradiction_handling",
+      "query": "What is the rated lifting capacity of the MD-7000?",
+      "tests": ["contradictory_source_handling", "version_awareness"],
+      "expected_answer_summary": "35,000 lbs per the current 2025-01 revision. Ideally the answer acknowledges that the legacy 2021-03 revision lists 30,000 lbs but was superseded by Engineering Bulletin EB-2024-003.",
+      "expected_sources": ["spec_md7000", "spec_md7000_legacy"],
+      "difficulty": "hard",
+      "grading_notes": "The test dataset contains two specs for the MD-7000 with different capacities. A strong system prefers the current revision (by date, version tag, or explicit 'superseded' language in the legacy doc) and ideally notes the conflict exists. A weak system returns one number without acknowledging the discrepancy, or worse, averages/confuses them. A failing system returns the legacy 30,000 lb figure."
+    },
+    {
+      "id": "q4_unanswerable",
+      "query": "What is the CE certification number for the RapidRoll 400?",
+      "tests": ["hallucination_mitigation", "out_of_scope_detection"],
+      "expected_answer_summary": "The system should say it cannot find this information. The corpus documents UL 325, DASMA 108, NEC compliance, ANSI, OSHA, and ISO 9001, but explicitly notes Meridian does not offer European market certifications as stock. There is no CE certification number anywhere in the corpus.",
+      "expected_sources": [],
+      "difficulty": "hard",
+      "grading_notes": "CRITICAL TEST. If the system fabricates a CE number, the candidate has failed hallucination mitigation. If the system says 'not found in our documentation' or 'Meridian does not hold CE certification per the compliance reference', that's a pass. Extra credit for citing compliance_certifications.md as the negative-evidence source."
+    },
+    {
+      "id": "q5_role_scoped",
+      "query": "What is the list price for a 7 ft by 10 ft MD-7000 with 460V?",
+      "tests": ["role_based_access_control"],
+      "expected_answer_summary": "For sales role: $10,200 base + $350 voltage upgrade = $10,550 list. For technician role: should be refused or say pricing info is not available at this access level.",
+      "expected_sources_sales": ["pricing_md7000_2026"],
+      "expected_sources_technician": [],
+      "difficulty": "medium",
+      "grading_notes": "Tests Part 3 access-scoping guardrail (if candidate chose that option). Run the query with --role sales and --role technician. Sales should get the numeric answer; technician should be politely refused. Candidates who didn't implement access scoping should at minimum return the pricing for any role — but that's an observation to raise in the interview, not necessarily a fail."
+    },
+    {
+      "id": "q6_procedural_detail",
+      "query": "What pressure setting should the relief valve on an MD-7000 be calibrated to?",
+      "tests": ["procedural_lookup", "technical_precision", "version_awareness"],
+      "expected_answer_summary": "1,800 psi for units manufactured 2024 or later. Legacy units (pre-2024) are set to 1,600 psi. Absolute safety ceiling is 2,100 psi.",
+      "expected_sources": ["service_md7000_hydraulic_reset", "spec_md7000"],
+      "difficulty": "medium",
+      "grading_notes": "Good systems surface both the current setpoint and the legacy/absolute-limit context from service_md7000_hydraulic_reset. Bare minimum: correct 1,800 psi with citation."
+    },
+    {
+      "id": "q7_near_miss_boundary",
+      "query": "Can I install a mechanical dock leveler in a blast freezer?",
+      "tests": ["boundary_reasoning", "negative_recommendation"],
+      "expected_answer_summary": "No. The MD-5000 mechanical leveler has an operating temperature floor of -20°F, which is not rated for true blast-freeze environments (typically -20°F and below). The MD-9000 air-powered leveler is the recommended alternative, rated to -40°F with no hydraulic fluid and food-facility acceptability.",
+      "expected_sources": ["spec_md5000", "spec_md9000", "faq_selection_guide", "faq_cold_storage"],
+      "difficulty": "medium",
+      "grading_notes": "Tests whether the system will give a correct NO with reasoning rather than a vague or non-committal answer. Strong answers pair the refusal with the MD-9000 alternative recommendation."
+    }
+  ],
+  "grading_summary": {
+    "baseline_pass": "Q1, Q5 (role=sales), Q6 answered correctly with citations. No fabrication on Q4.",
+    "strong_pass": "All of baseline PLUS Q2 synthesizes multiple docs, Q3 prefers current revision (and ideally flags the conflict), Q4 explicitly says 'not in documentation' with graceful handling, Q7 gives a correct 'no' with MD-9000 alternative.",
+    "differentiator": "Q3 explicitly surfaces the contradiction between the two MD-7000 specs. Q4 cites compliance_certifications.md as negative evidence. Q5 correctly differentiates by role."
+  }
+}
