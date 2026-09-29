@@ -10,7 +10,7 @@ This application is for demonstration purposes only and is not intended for depl
 
  `mka` (Meridian Knowledge Assistant) is a Command Line Interface for sales and technicians. It accomplishes safety-first retrieval by including explicit document receipts and safety warnings with every response. The system also minimizes the possibility of hallucination by requiring attribution for every claim that the system produces. It's built in Python 3 via uv for fast package management.
 
-The main goal of this project was to avoid wrong answers at all costs. We bias towards being conservative. We cannot allow a hallucination to slip through. We will not make an operational mistake. To accomplish this, the following decisions were made:
+The main goal of this project was to avoid wrong answers at all costs. To accomplish this, the following decisions were made:
 
 - GPT-5.4-nano is used specifically for its low (~3%) hallucination rate and low latency ([https://github.com/vectara/hallucination-leaderboard/](https://github.com/vectara/hallucination-leaderboard/)).
 - The vector store is Pinecone DB, chosen for low latency retrieval (~30ms in ideal conditions) and ease to set up.
