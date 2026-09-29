@@ -80,6 +80,28 @@ def upsert(cfg: Config, vectors: list[Chunk], embeddings: list[list[float]]) -> 
             index.upsert(vectors=batch, namespace=cfg.pinecone_namespace)
 
 
+def fetch(cfg: Config, ids: list[str]) -> list[Hit]:
+    """Load chunks by id. A missing id is omitted; it is not an error."""
+    if not ids:
+        return []
+    try:
+        with _timed("fetch", namespace=cfg.pinecone_namespace, ids=len(ids)) as detail:
+            response = _index(cfg).fetch(ids=ids, namespace=cfg.pinecone_namespace)
+            vectors = getattr(response, "vectors", None) or {}
+            hits = [
+                _hit_from_vector(vector_id, vector)
+                for vector_id, vector in vectors.items()
+            ]
+            detail["matches"] = len(hits)
+            read_units = usage.lookup(usage.lookup(response, "usage"), "read_units")
+            if read_units is not None:
+                detail["read_units"] = read_units
+            return hits
+    except Exception as exc:
+        _raise_missing_index(cfg, exc)
+        raise
+
+
 def query(cfg: Config, vector: list[float], filter: dict, top_k: int) -> list[Hit]:
     try:
         with _timed("query", namespace=cfg.pinecone_namespace, top_k=top_k) as detail:
@@ -119,9 +141,23 @@ def _raise_missing_index(cfg: Config, exc: Exception) -> None:
 
 def _hit(match: object) -> Hit:
     meta = getattr(match, "metadata", None) or {}
+    return _hit_from_meta(str(match.id), float(match.score), meta)
+
+
+def _hit_from_vector(vector_id: str, vector: object) -> Hit:
+    if isinstance(vector, dict):
+        meta = vector.get("metadata") or {}
+        vid = str(vector.get("id") or vector_id)
+    else:
+        meta = getattr(vector, "metadata", None) or {}
+        vid = str(getattr(vector, "id", None) or vector_id)
+    return _hit_from_meta(vid, 0.0, meta)
+
+
+def _hit_from_meta(id: str, score: float, meta: dict) -> Hit:
     return Hit(
-        id=match.id,
-        score=float(match.score),
+        id=id,
+        score=score,
         text=str(meta.get("text", "")),
         title=str(meta.get("title", "")),
         path=str(meta.get("path", "")),

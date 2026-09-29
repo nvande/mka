@@ -7,13 +7,13 @@ import re
 import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from mka import store, usage
 from mka.config import Config
 from mka.llm import Chat, Embeddings, make_chat, make_embeddings
 from mka.pricing import PRICE, asks_for_price
-from mka.products import canonical_models_in, catalog_hint, scope_glossary
+from mka.products import FAMILIES, canonical_models_in, catalog_hint, scope_glossary
 from mka.safety import print_safety_staple, resolve_warnings
 from mka.spinner import Spinner
 from mka.types import Hit, Role
@@ -72,6 +72,7 @@ Do not answer the user. Do not cite. Reply with exactly one token."""
 GEN_SYS = """Answer the user using only the provided current chunks.
 Use only information supported by the chunks. Do not infer missing facts from general knowledge, product names, model numbers, similar products, industry conventions, or the structure of the question.
 If the question concerns our products, answer specifically about our products.
+When the question asks what to specify and why, answer both parts from the chunks. If a chunk's question begins with "Why", include the cause that chunk states, including how a fluid, material, or component behaves and why the alternative is a poor fit. Do not omit that cause because another chunk already states an operating range, a contamination note, or a rating.
 Each chunk includes flagged_outdated from the catalog. Do not use information from chunks where flagged_outdated is true in the answer.
 If an outdated chunk contains a value that differs from the current information used in the answer, put one short sentence describing that difference in outdated_note. Otherwise outdated_note is null.
 If two or more current documents disagree about the same fact:
@@ -82,7 +83,8 @@ If two or more current documents disagree about the same fact:
 Return JSON: {"answer": string, "citation_ids": string[], "outdated_note": string|null}
 citation_ids must contain only ids from the provided chunks. At least one citation is required.
 Cite every chunk that directly supports a product fact, value, limit, recommendation, or procedure used in the answer. Do not cite unused chunks.
-If the provided chunks do not support a fact, do not state it."""
+If the provided chunks do not support a fact, do not state it.
+Answer only the question that was asked, then stop. Do not invite a follow-up, offer to continue, ask for more details, or suggest a next step. Do not write closers such as "if you want", "tell me", "let me know", or "I can also"."""
 
 REFUSE_REASONS = ("MISSING_INFO", "AMBIGUOUS", "UNKNOWN")
 
@@ -204,21 +206,33 @@ def _run_ask(
             complete_citations(draft.citation_ids, draft.answer, usable),
             draft.outdated_note,
         )
+        # Nano keeps the operating range and drops the mechanism in the Why
+        # chunk, even when that chunk is cited. Python adds the sentence back.
+        answer, reason_ids = include_documented_cause(query, draft.answer, usable)
+        citation_ids = list(draft.citation_ids)
+        for reason_id in reason_ids:
+            if reason_id not in citation_ids:
+                citation_ids.append(reason_id)
         # Hazard notes. Read from the cache ingest wrote; no model call.
-        cited = [hit for hit in usable if hit.id in set(draft.citation_ids)]
+        cited = [hit for hit in usable if hit.id in set(citation_ids)]
         warnings = resolve_warnings(cited)
         # Superseded revisions. Python decides from the flags whether a note
         # prints, so the model can neither skip a real conflict nor invent one.
-        superseded = superseded_hits(usable, cited)
+        # Naming a model is not a conflict. The note is for a value the answer
+        # took from the current document.
+        conflict = [hit for hit in cited if _shares_number(answer, hit.text)]
+        superseded = superseded_hits(usable, conflict)
         note = outdated_note(draft.outdated_note, superseded)
-        answer = draft.answer if superseded else strip_outdated_claims(draft.answer)
+        if not superseded:
+            answer = strip_outdated_claims(answer)
+        answer = strip_follow_ups(answer)
         spin.stop()
         print(answer)
         if note:
             print(note)
         print_safety_staple(warnings, role)
-        extra = [hit.id for hit in superseded if hit.id not in draft.citation_ids]
-        print_sources(draft.citation_ids + extra, usable)
+        extra = [hit.id for hit in superseded if hit.id not in citation_ids]
+        print_sources(citation_ids + extra, usable)
         return 0
     except Exception as exc:
         # A gate that could not run is an outage, not a decision about the
@@ -293,6 +307,10 @@ def retrieve(cfg: Config, embeddings: Embeddings, query: str, role: Role) -> lis
     hits = drop_technician_prices(role, hits)
     hits = cap_per_doc(hits, cfg.max_chunks_per_doc)[: cfg.top_k]
     hits = follow_up_specs(cfg, embeddings, role, hits)
+    # The reason for a recommendation is often the next FAQ question. It ranks
+    # below the recommendation itself, so the per-document cap drops it and the
+    # answer can name the product without the documented mechanism.
+    hits = follow_up_reasons(cfg, role, query, hits)
     return drop_technician_prices(role, hits)
 
 
@@ -340,6 +358,116 @@ def follow_up_specs(
     return hits + drop_technician_prices(role, extra)
 
 
+_FAQ_CHUNK = re.compile(r"^(.+)::q(\d+)$")
+_WHY_QUESTION = re.compile(r"^## Q:\s*Why\b", re.I)
+_WANTS_REASON = re.compile(
+    r"\b(?:why|reason|reasons|recommend(?:ed|ation)?|specify|suited)\b",
+    re.I,
+)
+
+
+def follow_up_reasons(cfg: Config, role: Role, query: str, hits: list[Hit]) -> list[Hit]:
+    """Attach a neighboring FAQ question that explains a retrieved recommendation."""
+    if not _WANTS_REASON.search(query):
+        return hits
+    known = {hit.id for hit in hits}
+    wanted: list[tuple[str, str, float]] = []
+    for hit in hits:
+        if hit.doc_type != "faq":
+            continue
+        match = _FAQ_CHUNK.fullmatch(hit.id)
+        if match is None:
+            continue
+        doc_id, number = match.group(1), int(match.group(2))
+        # The next question explains this one. The previous question explains
+        # a different topic, so it stays out.
+        chunk_id = f"{doc_id}::q{number + 1}"
+        if chunk_id in known:
+            continue
+        known.add(chunk_id)
+        wanted.append((chunk_id, hit.id, hit.score))
+    if not wanted:
+        return hits
+    fetched = {hit.id: hit for hit in store.fetch(cfg, [chunk_id for chunk_id, _, _ in wanted])}
+    by_parent: dict[str, list[Hit]] = {}
+    for chunk_id, parent_id, score in wanted:
+        hit = fetched.get(chunk_id)
+        if hit is None or not _is_why_question(hit.text):
+            continue
+        if not _role_can_see(role, hit):
+            continue
+        by_parent.setdefault(parent_id, []).append(replace(hit, score=score))
+    if not by_parent:
+        return hits
+    out: list[Hit] = []
+    for hit in hits:
+        out.append(hit)
+        out.extend(by_parent.get(hit.id, []))
+    return out
+
+
+_CAUSE_WORD = re.compile(r"[a-z]{7,}")
+_ANSWER_MARK = re.compile(r"\*\*A:\*\*\s*", re.I)
+_SENTENCE = re.compile(r".+?[.!?](?:\s|$)")
+
+
+def include_documented_cause(
+    query: str, answer: str, hits: list[Hit]
+) -> tuple[str, list[str]]:
+    """Add the opening sentence of a retrieved Why answer when the draft omitted it."""
+    if not _WANTS_REASON.search(query):
+        return answer, []
+    missing: list[str] = []
+    ids: list[str] = []
+    for hit in hits:
+        if hit.flagged_outdated or not _is_why_question(hit.text):
+            continue
+        sentence = _cause_sentence(hit.text)
+        if sentence is None or _cause_stated(answer, sentence):
+            continue
+        missing.append(sentence)
+        ids.append(hit.id)
+    if not missing:
+        return answer, []
+    return answer.rstrip() + "\n\n" + " ".join(missing), ids
+
+
+def _cause_sentence(text: str) -> str | None:
+    mark = _ANSWER_MARK.search(text)
+    if mark is None:
+        return None
+    body = text[mark.end() :].strip()
+    if not body:
+        return None
+    found = _SENTENCE.match(body)
+    sentence = found.group(0).strip() if found else body.split("\n", 1)[0].strip()
+    return sentence or None
+
+
+def _cause_stated(answer: str, sentence: str) -> bool:
+    words = _CAUSE_WORD.findall(sentence.lower())
+    if not words:
+        return True
+    have = set(_CAUSE_WORD.findall(answer.lower()))
+    return sum(word in have for word in words) * 2 >= len(words)
+
+
+def _is_why_question(text: str) -> bool:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return _WHY_QUESTION.match(stripped) is not None
+    return False
+
+
+def _role_can_see(role: Role, hit: Hit) -> bool:
+    if role == "sales" and hit.doc_type == "service":
+        return False
+    if role == "technician" and (hit.doc_type == "pricing" or PRICE.search(hit.text)):
+        return False
+    return True
+
+
 def _models_missing_spec(hits: list[Hit]) -> list[str]:
     mentioned: list[str] = []
     seen: set[str] = set()
@@ -370,7 +498,7 @@ def complete_citations(ids: list[str], answer: str, hits: list[Hit]) -> list[str
     cited_docs = {hit.doc_id for hit in hits if hit.id in have}
     extra: list[str] = []
     for hit in hits:
-        if hit.id in have or hit.doc_id in cited_docs:
+        if hit.id in have or hit.doc_id in cited_docs or hit.flagged_outdated:
             continue
         if named.intersection(canonical_models_in(hit.text)):
             extra.append(hit.id)
@@ -483,6 +611,49 @@ def superseded_hits(usable: list[Hit], cited: list[Hit]) -> list[Hit]:
 
 _NUMBER = re.compile(r"\d[\d,.\-]*\d|\d")
 _OUTDATED_SENTENCE = re.compile(r"[^.!?\n]*\boutdated\b[^.!?\n]*[.!?]?[ \t]*", re.I)
+_FOLLOW_UP = re.compile(
+    r"[^.!?\n]*(?:"
+    r"\bif you (?:want|need|wish|would like|'d like)\b"
+    r"|\blet me know\b"
+    r"|\bfeel free\b"
+    r"|\bhappy to\b"
+    r"|\bi can (?:also|map|help)\b"
+    r"|\btell me (?:your|more|about|the|if)\b"
+    r"|\bwant me to\b"
+    r")[^.!?\n]*[.!?]?[ \t]*",
+    re.I,
+)
+
+
+def _shares_number(answer: str, text: str) -> bool:
+    """True when the answer uses a measured value from this chunk.
+
+    List markers and other short integers do not count, so a numbered
+    recommendation does not look like a conflict with an unrelated spec.
+    """
+    return bool(_material_numbers(answer) & _material_numbers(text))
+
+
+def _material_numbers(text: str) -> set[str]:
+    found: set[str] = set()
+    for token in _NUMBER.findall(_without_model_names(text)):
+        digits = re.sub(r"\D", "", token)
+        if len(digits) >= 3 or "," in token or "." in token:
+            found.add(token)
+    return found
+
+
+def _without_model_names(text: str) -> str:
+    cleaned = text
+    for family in FAMILIES:
+        for model in family.models:
+            cleaned = re.sub(
+                rf"(?<![A-Za-z0-9]){re.escape(model)}(?![A-Za-z0-9])",
+                " ",
+                cleaned,
+                flags=re.I,
+            )
+    return cleaned
 
 
 def outdated_note(note: str | None, superseded: list[Hit]) -> str | None:
@@ -512,6 +683,11 @@ def strip_outdated_claims(answer: str) -> str:
     # No superseded revision was retrieved, so any sentence about an
     # outdated document is the model inventing a conflict. Drop it.
     return _OUTDATED_SENTENCE.sub("", answer).strip()
+
+
+def strip_follow_ups(answer: str) -> str:
+    # The model adds an offer to keep going. The question is already answered.
+    return _FOLLOW_UP.sub("", answer).strip()
 
 
 def _unique_by_doc(hits: list[Hit]) -> list[Hit]:

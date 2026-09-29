@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from mka import usage
-from mka.store import delete_index, ensure_index, query, upsert, wipe_namespace
+from mka.store import delete_index, ensure_index, fetch, query, upsert, wipe_namespace
 from mka.types import Chunk, Hit
 
 from conftest import make_config
@@ -83,6 +83,58 @@ def test_delete_index_waits_until_gone(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr("mka.store._client", lambda cfg: _FakeClient())
     assert delete_index(make_config(tmp_path), wait=1, poll=0) is True
+
+
+def test_fetch_maps_vectors_and_omits_missing_ids(tmp_path, monkeypatch) -> None:
+    class Index:
+        def fetch(self, **kwargs):
+            self.kwargs = kwargs
+            return SimpleNamespace(
+                vectors={
+                    "faq::q1": SimpleNamespace(
+                        id="faq::q1",
+                        metadata={
+                            "text": "## Q: Why air-powered?\nHydraulic fluid viscosity.",
+                            "title": "FAQ",
+                            "path": "docs/faq.md",
+                            "doc_id": "faq",
+                            "model": "multi",
+                            "doc_type": "faq",
+                            "flagged_outdated": False,
+                            "contains_warning": False,
+                            "warning_text": "",
+                        },
+                    )
+                },
+                usage=SimpleNamespace(read_units=1),
+            )
+
+    fake = Index()
+    monkeypatch.setattr("mka.store._index", lambda cfg: fake)
+    cfg = make_config(tmp_path)
+    with usage.track("ask") as ledger:
+        hits = fetch(cfg, ["faq::q1", "faq::q9"])
+    assert fake.kwargs["ids"] == ["faq::q1", "faq::q9"]
+    assert fake.kwargs["namespace"] == "poc"
+    assert len(hits) == 1
+    assert isinstance(hits[0], Hit)
+    assert hits[0].id == "faq::q1"
+    assert hits[0].score == 0.0
+    assert "viscosity" in hits[0].text
+    assert hits[0].doc_type == "faq"
+    call = ledger.pinecone[0]
+    assert call.op == "fetch"
+    assert call.detail["matches"] == 1
+    assert call.detail["read_units"] == 1
+
+
+def test_fetch_empty_ids_does_not_call_pinecone(tmp_path, monkeypatch) -> None:
+    def boom(cfg):
+        del cfg
+        raise AssertionError("empty fetch should not open the index")
+
+    monkeypatch.setattr("mka.store._index", boom)
+    assert fetch(make_config(tmp_path), []) == []
 
 
 def test_query_maps_hit_and_records_stats(tmp_path, monkeypatch) -> None:

@@ -21,12 +21,15 @@ from mka.ask import (
     classify_scope,
     complete_citations,
     explain_refuse,
+    follow_up_reasons,
+    include_documented_cause,
     format_refuse,
     outdated_note,
     pinecone_filter,
     receipt_ok,
     retrieve,
     run_ask,
+    strip_follow_ups,
     strip_outdated_claims,
     superseded_hits,
     trivial_reject,
@@ -474,6 +477,18 @@ def test_strip_outdated_claims() -> None:
     assert strip_outdated_claims("Capacity is 35,000 lbs.") == "Capacity is 35,000 lbs."
 
 
+def test_strip_follow_ups_drops_the_offer_to_continue() -> None:
+    answer = (
+        "Specify the MD-9000 with a ThermaGuard 600.\n\n"
+        "If you want, tell me your dock pit and electrical/air constraints and "
+        "I can map these to the installation requirements."
+    )
+    assert strip_follow_ups(answer) == "Specify the MD-9000 with a ThermaGuard 600."
+    assert strip_follow_ups("The MD-9000 needs 80–100 psi compressed air.") == (
+        "The MD-9000 needs 80–100 psi compressed air."
+    )
+
+
 def test_run_ask_superseded_revision_always_gets_a_note_and_source(tmp_path, capsys) -> None:
     current = make_hit()
     legacy = make_hit(**LEGACY)
@@ -498,6 +513,45 @@ def test_run_ask_superseded_revision_always_gets_a_note_and_source(tmp_path, cap
     assert "Note: a superseded revision is also on file" in out
     assert f"- MD-7000 Specification (SUPERSEDED) (docs/spec_md7000_legacy.md, {legacy.id})" in out
     assert out.index("35,000 lbs.") < out.index("Note:") < out.index("Sources:")
+
+
+def test_naming_the_hydraulic_alternative_does_not_note_a_conflict(tmp_path, capsys) -> None:
+    current = make_hit(text="Model MD-7000. Rated capacity 35,000 lbs. Motor 2 HP.")
+    legacy = make_hit(
+        **{
+            **LEGACY,
+            "text": "Model MD-7000. Revision 2021-03. Rated lifting capacity: 30,000 lbs.",
+        }
+    )
+    faq = make_hit(
+        id="faq_cold_storage::q0",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="The standard recommendation is an MD-9000 air-powered dock leveler.",
+    )
+    chat = ScriptedChat(
+        {
+            SCOPE_SYS: "ALLOW",
+            DECIDE_SYS: "ANSWER",
+            GEN_SYS: gen_json(
+                "Specify the MD-9000. Hydraulic fluid viscosity increases significantly "
+                "at low temperatures, slowing the MD-7000 response and stressing seals.",
+                faq.id,
+            ),
+        }
+    )
+    code = run_ask(
+        make_config(tmp_path),
+        "technician",
+        "What equipment should I specify and why?",
+        chat=chat,
+        retriever=lambda query, role: [faq, current, legacy],
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "viscosity" in out
+    assert "Note:" not in out
+    assert legacy.id not in out
 
 
 def test_run_ask_superseded_note_from_model_when_grounded(tmp_path, capsys) -> None:
@@ -1076,6 +1130,127 @@ def test_complete_citations_skips_docs_already_cited() -> None:
     a = make_hit(id="a::0", doc_id="spec_md9000", text="MD-9000 capacity 40,000")
     b = make_hit(id="a::1", doc_id="spec_md9000", text="MD-9000 temperature -40")
     assert complete_citations([a.id], "The MD-9000 is rated to -40°F.", [a, b]) == [a.id]
+
+
+def test_follow_up_reasons_keeps_the_adjacent_why_question(tmp_path, monkeypatch) -> None:
+    recommendation = make_hit(
+        id="faq_cold_storage::q0",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text=(
+            "## Q: What's your recommended configuration for a -10°F freezer dock?\n"
+            "**A:** MD-9000."
+        ),
+        score=0.74,
+    )
+    why = make_hit(
+        id="faq_cold_storage::q1",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text=(
+            "## Q: Why air-powered instead of hydraulic in cold storage?\n"
+            "**A:** Hydraulic fluid viscosity increases."
+        ),
+        score=0.0,
+    )
+    finishes = make_hit(
+        id="faq_cold_storage::q2",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="## Q: Do we need special finishes?\n**A:** Stainless.",
+        score=0.0,
+    )
+
+    def fake_fetch(cfg, ids):
+        del cfg
+        assert "faq_cold_storage::q1" in ids
+        return [why, finishes]
+
+    monkeypatch.setattr("mka.ask.store.fetch", fake_fetch)
+    out = follow_up_reasons(
+        make_config(tmp_path),
+        "technician",
+        "What equipment should I specify and why?",
+        [recommendation],
+    )
+    assert [hit.id for hit in out] == [recommendation.id, why.id]
+    assert out[1].score == recommendation.score
+
+
+def test_follow_up_reasons_skips_a_plain_lookup(tmp_path, monkeypatch) -> None:
+    def fake_fetch(cfg, ids):
+        del cfg, ids
+        raise AssertionError("plain lookup should not fetch neighbors")
+
+    monkeypatch.setattr("mka.ask.store.fetch", fake_fetch)
+    hit = make_hit(id="faq_cold_storage::q0", doc_id="faq_cold_storage", doc_type="faq")
+    out = follow_up_reasons(
+        make_config(tmp_path), "sales", "What is the rated lifting capacity?", [hit]
+    )
+    assert out == [hit]
+
+
+def test_follow_up_reasons_hides_priced_why_from_technician(tmp_path, monkeypatch) -> None:
+    recommendation = make_hit(
+        id="faq_cold_storage::q0",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        score=0.7,
+    )
+    priced = make_hit(
+        id="faq_cold_storage::q1",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="## Q: Why this option?\n**A:** Stainless lip +$1,200.",
+    )
+    monkeypatch.setattr("mka.ask.store.fetch", lambda cfg, ids: [priced])
+    out = follow_up_reasons(
+        make_config(tmp_path),
+        "technician",
+        "Which leveler should I specify and why?",
+        [recommendation],
+    )
+    assert [hit.id for hit in out] == [recommendation.id]
+
+
+WHY = (
+    "## Q: Why air-powered instead of hydraulic in cold storage?\n"
+    "**A:** Hydraulic fluid viscosity increases significantly at low temperatures, "
+    "slowing the MD-7000's response and stressing seals. The MD-9000 uses compressed "
+    "air, which performs consistently down to -40°F, and eliminates the risk of "
+    "hydraulic fluid contamination in food zones.\n"
+)
+
+
+def test_include_documented_cause_adds_the_omitted_mechanism() -> None:
+    why = make_hit(id="faq_cold_storage::q1", doc_id="faq_cold_storage", doc_type="faq", text=WHY)
+    draft = (
+        "Specify the MD-9000. It has no hydraulic fluid and operates down to -40°F, "
+        "so it meets the temperature requirement."
+    )
+    answer, ids = include_documented_cause(
+        "What equipment should I specify and why?",
+        draft,
+        [why],
+    )
+    assert "viscosity" in answer
+    assert answer.startswith(draft)
+    assert ids == [why.id]
+
+
+def test_include_documented_cause_leaves_a_complete_answer() -> None:
+    why = make_hit(id="faq_cold_storage::q1", doc_id="faq_cold_storage", doc_type="faq", text=WHY)
+    draft = (
+        "Specify the MD-9000 because hydraulic fluid viscosity increases significantly "
+        "at low temperatures, slowing the MD-7000 response and stressing seals."
+    )
+    answer, ids = include_documented_cause(
+        "What equipment should I specify and why?",
+        draft,
+        [why],
+    )
+    assert answer == draft
+    assert ids == []
 
 
 def test_retrieve_follow_up_pulls_missing_model_spec(tmp_path, monkeypatch) -> None:
