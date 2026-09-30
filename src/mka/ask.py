@@ -13,7 +13,13 @@ from mka import store, usage
 from mka.config import Config
 from mka.llm import Chat, Embeddings, make_chat, make_embeddings
 from mka.pricing import PRICE, asks_for_price
-from mka.products import FAMILIES, canonical_models_in, catalog_hint, scope_glossary
+from mka.products import (
+    FAMILIES,
+    canonical_models_in,
+    catalog_hint,
+    match_product_terms,
+    scope_glossary,
+)
 from mka.safety import print_safety_staple, resolve_warnings
 from mka.spinner import Spinner
 from mka.types import Hit, Role
@@ -73,6 +79,7 @@ GEN_SYS = """Answer the user using only the provided current chunks.
 Use only information supported by the chunks. Do not infer missing facts from general knowledge, product names, model numbers, similar products, industry conventions, or the structure of the question.
 If the question concerns our products, answer specifically about our products.
 When the question asks what to specify and why, answer both parts from the chunks. If a chunk's question begins with "Why", include the cause that chunk states, including how a fluid, material, or component behaves and why the alternative is a poor fit. Do not omit that cause because another chunk already states an operating range, a contamination note, or a rating.
+When the user asks for a checklist or procedure for one model or power type, and another chunk is headed for all models of that same product, the answer must list the checklist items from both chunks. The all-models items apply to the specific model. Write those items in the answer. Citing the all-models chunk is not enough. Do not drop them because the question names only air-powered, hydraulic, or one model. Do not add checklist sections for a different product family.
 Each chunk includes flagged_outdated from the catalog. Do not use information from chunks where flagged_outdated is true in the answer.
 If an outdated chunk contains a value that differs from the current information used in the answer, put one short sentence describing that difference in outdated_note. Otherwise outdated_note is null.
 If two or more current documents disagree about the same fact:
@@ -84,7 +91,7 @@ Return JSON: {"answer": string, "citation_ids": string[], "outdated_note": strin
 citation_ids must contain only ids from the provided chunks. At least one citation is required.
 Cite every chunk that directly supports a product fact, value, limit, recommendation, or procedure used in the answer. Do not cite unused chunks.
 If the provided chunks do not support a fact, do not state it.
-Answer only the question that was asked, then stop. Do not invite a follow-up, offer to continue, ask for more details, or suggest a next step. Do not write closers such as "if you want", "tell me", "let me know", or "I can also"."""
+Answer only the question that was asked, then stop. The all-models checklist items described above are part of that question, not extra material. Do not invite a follow-up, offer to continue, ask for more details, or suggest a next step. Do not write closers such as "if you want", "tell me", "let me know", or "I can also"."""
 
 REFUSE_REASONS = ("MISSING_INFO", "AMBIGUOUS", "UNKNOWN")
 
@@ -307,10 +314,9 @@ def retrieve(cfg: Config, embeddings: Embeddings, query: str, role: Role) -> lis
     hits = drop_technician_prices(role, hits)
     hits = cap_per_doc(hits, cfg.max_chunks_per_doc)[: cfg.top_k]
     hits = follow_up_specs(cfg, embeddings, role, hits)
-    # The reason for a recommendation is often the next FAQ question. It ranks
-    # below the recommendation itself, so the per-document cap drops it and the
-    # answer can name the product without the documented mechanism.
-    hits = follow_up_reasons(cfg, role, query, hits)
+    # One call for every split FAQ or service file already in hand, then
+    # family filtering happens locally.
+    hits = related_sub_chunks(cfg, role, vectors[0], hits)
     return drop_technician_prices(role, hits)
 
 
@@ -358,52 +364,98 @@ def follow_up_specs(
     return hits + drop_technician_prices(role, extra)
 
 
-_FAQ_CHUNK = re.compile(r"^(.+)::q(\d+)$")
 _WHY_QUESTION = re.compile(r"^## Q:\s*Why\b", re.I)
 _WANTS_REASON = re.compile(
     r"\b(?:why|reason|reasons|recommend(?:ed|ation)?|specify|suited)\b",
     re.I,
 )
+_FAMILY_NAMES = frozenset(family.family for family in FAMILIES)
+_SUB_CHUNK_DOCS = frozenset({"faq", "service"})
+_CHUNKED = re.compile(r"::[qs]\d+(?:::\d+)?$")
+# One query has to return every chunk of the split files already retrieved.
+# Those files are short; this covers all of them together.
+_RELATED_DOC_K = 64
 
 
-def follow_up_reasons(cfg: Config, role: Role, query: str, hits: list[Hit]) -> list[Hit]:
-    """Attach a neighboring FAQ question that explains a retrieved recommendation."""
-    if not _WANTS_REASON.search(query):
-        return hits
-    known = {hit.id for hit in hits}
-    wanted: list[tuple[str, str, float]] = []
+def related_sub_chunks(
+    cfg: Config, role: Role, vector: list[float], hits: list[Hit]
+) -> list[Hit]:
+    """Load split FAQ and service files in one query, then keep same-family chunks.
+
+    Families come only from the chunks already kept. A relative added here is
+    not a new seed, so its own families do not pull anything further.
+    """
+    families_by_doc: dict[str, set[str]] = {}
+    score_by_doc: dict[str, float] = {}
+    seeds: set[str] = set()
     for hit in hits:
-        if hit.doc_type != "faq":
-            continue
-        match = _FAQ_CHUNK.fullmatch(hit.id)
-        if match is None:
-            continue
-        doc_id, number = match.group(1), int(match.group(2))
-        # The next question explains this one. The previous question explains
-        # a different topic, so it stays out.
-        chunk_id = f"{doc_id}::q{number + 1}"
-        if chunk_id in known:
-            continue
-        known.add(chunk_id)
-        wanted.append((chunk_id, hit.id, hit.score))
-    if not wanted:
-        return hits
-    fetched = {hit.id: hit for hit in store.fetch(cfg, [chunk_id for chunk_id, _, _ in wanted])}
-    by_parent: dict[str, list[Hit]] = {}
-    for chunk_id, parent_id, score in wanted:
-        hit = fetched.get(chunk_id)
-        if hit is None or not _is_why_question(hit.text):
+        if hit.doc_type not in _SUB_CHUNK_DOCS or _CHUNKED.search(hit.id) is None:
             continue
         if not _role_can_see(role, hit):
             continue
-        by_parent.setdefault(parent_id, []).append(replace(hit, score=score))
-    if not by_parent:
+        families = _families_in(hit.text)
+        if not families:
+            continue
+        families_by_doc.setdefault(hit.doc_id, set()).update(families)
+        previous = score_by_doc.get(hit.doc_id, hit.score)
+        score_by_doc[hit.doc_id] = max(previous, hit.score)
+        seeds.add(hit.id)
+    if not families_by_doc:
+        return hits
+    found = store.query(
+        cfg,
+        vector,
+        _docs_filter(role, list(families_by_doc)),
+        _RELATED_DOC_K,
+    )
+    known = {hit.id for hit in hits}
+    extras: dict[str, list[Hit]] = {}
+    for hit in found:
+        families = families_by_doc.get(hit.doc_id)
+        if not families or hit.id in known:
+            continue
+        if hit.doc_type not in _SUB_CHUNK_DOCS or not _role_can_see(role, hit):
+            continue
+        if not _families_in(hit.text) & families:
+            continue
+        known.add(hit.id)
+        extras.setdefault(hit.doc_id, []).append(replace(hit, score=score_by_doc[hit.doc_id]))
+    if not extras:
         return hits
     out: list[Hit] = []
+    attached: set[str] = set()
     for hit in hits:
         out.append(hit)
-        out.extend(by_parent.get(hit.id, []))
+        if hit.id not in seeds or hit.doc_id in attached:
+            continue
+        out.extend(sorted(extras.get(hit.doc_id, []), key=_chunk_order))
+        attached.add(hit.doc_id)
     return out
+
+
+def _docs_filter(role: Role, doc_ids: list[str]) -> dict:
+    role_filter = pinecone_filter(role)
+    clause = {"doc_id": {"$in": doc_ids}}
+    if "$and" in role_filter:
+        return {"$and": [*role_filter["$and"], clause]}
+    return {"$and": [role_filter, clause]}
+
+
+def _families_in(text: str) -> set[str]:
+    """Catalog families named by a model, a family synonym, or a component."""
+    return {
+        family
+        for _term, family in match_product_terms(text)
+        if family in _FAMILY_NAMES
+    }
+
+
+def _chunk_order(hit: Hit) -> tuple:
+    match = re.search(r"::([qs])(\d+)(?:::(\d+))?$", hit.id)
+    if match is None:
+        return (hit.id,)
+    sub = int(match.group(3)) if match.group(3) else -1
+    return (match.group(1), int(match.group(2)), sub)
 
 
 _CAUSE_WORD = re.compile(r"[a-z]{7,}")

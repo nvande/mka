@@ -19,6 +19,7 @@ _REVISION = re.compile(r"(?i)^(\*\*Revision:\*\*|Revision:)", re.M)
 _QA_MARK = re.compile(r"^## Q:", re.M)
 _QA_SPLIT = re.compile(r"(?=^## Q:)", re.M)
 _H2_SPLIT = re.compile(r"(?=^## )", re.M)
+_H3_SPLIT = re.compile(r"(?=^### )", re.M)
 _SYMPTOM = re.compile(r"^## Symptom:", re.M)
 _FAULT = re.compile(r"^### E\d+", re.M)
 _FAULT_SPLIT = re.compile(r"(?=^### E\d+)", re.M)
@@ -135,11 +136,18 @@ def _split_pm_topics(row: ManifestRow, text: str) -> list[_Piece] | None:
             current += section
             continue
         if current:
-            issues.append(current)
+            issues.extend(_explode_h3(current))
         current = section
     if current:
-        issues.append(current)
+        issues.extend(_explode_h3(current))
     return _service_pieces(row, preamble, issues, tail)
+
+
+def _explode_h3(section: str) -> list[str]:
+    # "Dock levelers (all models)" and "Hydraulic models" are separate chunks.
+    # A match on the model section can then pull the all-models checklist.
+    parts = [part for part in _H3_SPLIT.split(section) if part.strip()]
+    return parts or [section]
 
 
 def _service_pieces(row: ManifestRow, preamble: str, issues: list[str], tail: str) -> list[_Piece]:
