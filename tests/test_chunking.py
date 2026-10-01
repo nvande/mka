@@ -314,15 +314,16 @@ def test_service_pm_topics_share_purpose_and_documentation() -> None:
         "service_annual_pm_checklist::s1",
         "service_annual_pm_checklist::s2",
         "service_annual_pm_checklist::s3",
+        "service_annual_pm_checklist::s4",
     ]
     assert all("## Purpose" in chunk.text for chunk in chunks)
     assert all("## Documentation" in chunk.text for chunk in chunks)
     assert "Dock levelers" in chunks[0].text
-    assert "Hydraulic models" in chunks[0].text
-    assert "Industrial doors" in chunks[1].text
-    assert "Hydraulic models" not in chunks[1].text
-    assert "Vehicle restraints" in chunks[2].text
-    assert "Electrical" in chunks[3].text
+    assert "Hydraulic models" not in chunks[0].text
+    assert "Hydraulic models" in chunks[1].text
+    assert "Industrial doors" in chunks[2].text
+    assert "Vehicle restraints" in chunks[3].text
+    assert "Electrical" in chunks[4].text
 
 
 def test_single_procedure_service_file_stays_one_chunk() -> None:
@@ -382,7 +383,7 @@ def test_corpus_service_sanity() -> None:
     cases = [
         ("service_md7000_lip_control.md", "service_md7000_lip_control", 4, "::s"),
         ("service_dockguard_diagnostics.md", "service_dockguard_diagnostics", 5, "::s"),
-        ("service_annual_pm_checklist.md", "service_annual_pm_checklist", 4, "::s"),
+        ("service_annual_pm_checklist.md", "service_annual_pm_checklist", 8, "::s"),
         ("service_md7000_hydraulic_reset.md", "service_md7000_hydraulic_reset", 1, "::0"),
         ("service_rapidroll_photoeye.md", "service_rapidroll_photoeye", 1, "::0"),
         ("service_thermaguard_spring.md", "service_thermaguard_spring", 1, "::0"),
@@ -404,8 +405,10 @@ def test_corpus_service_sanity() -> None:
         _service_row("service_annual_pm_checklist"),
         (docs / "service_annual_pm_checklist.md").read_text(encoding="utf-8"),
     )
-    assert "Hydraulic models" in pm[0].text
-    assert "Hydraulic models" not in pm[1].text
+    assert "Dock levelers" in pm[0].text
+    assert "Hydraulic models" not in pm[0].text
+    assert "Hydraulic models" in pm[1].text
+    assert "Air-powered" in pm[2].text
     for name, doc_id, count, suffix in cases:
         chunks = chunk_document(
             _service_row(doc_id),

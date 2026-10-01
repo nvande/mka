@@ -8,7 +8,8 @@ from pathlib import Path
 # Product catalog for the scope gate. Users say "leveler", never "MD-7000".
 #
 # catalog.json is committed and hand-maintained: families, models, synonyms,
-# and named components. It is loaded once at import. Nothing writes to it.
+# named components, and universal terms that belong to every family. It is
+# loaded once at import. Nothing writes to it.
 
 CATALOG_PATH = Path(__file__).with_name("catalog.json")
 
@@ -24,6 +25,7 @@ class ProductFamily:
 class Catalog:
     families: tuple[ProductFamily, ...]
     components: tuple[tuple[str, str], ...]
+    universal: tuple[str, ...] = ()
 
 
 def load_catalog(path: Path) -> Catalog:
@@ -45,6 +47,7 @@ def load_catalog(path: Path) -> Catalog:
         components = tuple(
             (str(row["term"]), str(row["family"])) for row in payload["components"]
         )
+        universal = tuple(str(item) for item in payload.get("universal", ()))
     except (OSError, TypeError, ValueError, KeyError) as exc:
         raise RuntimeError(f"cannot read product catalog {path}: {exc}") from exc
     if not families:
@@ -54,7 +57,7 @@ def load_catalog(path: Path) -> Catalog:
     unknown = sorted({fam for _term, fam in components if fam not in names})
     if unknown:
         raise RuntimeError(f"{path} has components in undeclared families: {unknown}")
-    return Catalog(families, components)
+    return Catalog(families, components, universal)
 
 
 # Loaded once at import: ask.py bakes scope_glossary() into its system prompt,
@@ -62,6 +65,7 @@ def load_catalog(path: Path) -> Catalog:
 _CATALOG = load_catalog(CATALOG_PATH)
 FAMILIES = _CATALOG.families
 COMPONENTS = _CATALOG.components
+UNIVERSAL = _CATALOG.universal
 
 
 def _model_aliases(model: str) -> list[str]:
@@ -78,25 +82,30 @@ def _pairs() -> list[tuple[str, str]]:
                 pairs.append((alias, family.family))
         for syn in family.synonyms:
             pairs.append((syn.lower(), family.family))
+    for term in UNIVERSAL:
+        for family in FAMILIES:
+            pairs.append((term.lower(), family.family))
     pairs.extend(COMPONENTS)
     return pairs
 
 
-def _build_patterns() -> list[tuple[re.Pattern[str], str, str]]:
+def _build_patterns() -> list[tuple[re.Pattern[str], str, tuple[str, ...]]]:
     # Longest first, so "dock leveler" matches before "leveler" and the
     # shorter span is skipped. The lookaround keeps the match off the
-    # inside of a longer token.
-    seen: set[str] = set()
-    unique: list[tuple[str, str]] = []
+    # inside of a longer token. A term listed for several families, such as
+    # a universal term, keeps every family.
+    grouped: dict[str, tuple[str, tuple[str, ...]]] = {}
     for term, family in sorted(_pairs(), key=lambda item: len(item[0]), reverse=True):
         key = term.casefold()
-        if key in seen:
+        saved = grouped.get(key)
+        if saved is None:
+            grouped[key] = (term, (family,))
             continue
-        seen.add(key)
-        unique.append((term, family))
+        if family not in saved[1]:
+            grouped[key] = (saved[0], saved[1] + (family,))
     return [
-        (re.compile(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", re.I), term, family)
-        for term, family in unique
+        (re.compile(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", re.I), term, families)
+        for term, families in grouped.values()
     ]
 
 
@@ -154,13 +163,13 @@ def match_product_terms(query: str) -> list[tuple[str, str]]:
     """
     found: list[tuple[str, str]] = []
     seen_spans: list[tuple[int, int]] = []
-    for pattern, term, family in _PATTERNS:
+    for pattern, term, families in _PATTERNS:
         for hit in pattern.finditer(query):
             span = hit.span()
             if any(span[0] >= start and span[1] <= end for start, end in seen_spans):
                 continue
             seen_spans.append(span)
-            found.append((term, family))
+            found.extend((term, family) for family in families)
     return found
 
 
@@ -184,4 +193,6 @@ def scope_glossary() -> str:
         models = f" ({', '.join(family.models)})" if family.models else ""
         syns = ", ".join(family.synonyms[:8])
         lines.append(f"- {family.family}{models}: {syns}")
+    if UNIVERSAL:
+        lines.append(f"- every product family: {', '.join(UNIVERSAL)}")
     return "\n".join(lines)

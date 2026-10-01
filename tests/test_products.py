@@ -92,6 +92,17 @@ def test_longest_match_wins() -> None:
     assert match_product_terms("dock leveler capacity") == [("dock leveler", "dock leveler")]
 
 
+def test_hydraulic_and_air_powered_are_dock_levelers() -> None:
+    assert "dock leveler" in _families("Hydraulic models (MD-7000)")
+    assert "dock leveler" in _families("Air-powered models (MD-9000)")
+    assert "dock leveler" in _families("### Air powered models")
+
+
+def test_electrical_belongs_to_every_family() -> None:
+    assert _families("Electrical (all equipment)") == {family.family for family in FAMILIES}
+    assert match_product_terms("electrically insulated") == []
+
+
 def test_bare_door_is_not_a_catalog_hit() -> None:
     assert match_product_terms("Please close the door") == []
     assert match_product_terms("Write me a poem") == []

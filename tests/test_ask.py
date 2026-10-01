@@ -21,7 +21,7 @@ from mka.ask import (
     classify_scope,
     complete_citations,
     explain_refuse,
-    follow_up_reasons,
+    related_sub_chunks,
     include_documented_cause,
     format_refuse,
     outdated_note,
@@ -1132,85 +1132,243 @@ def test_complete_citations_skips_docs_already_cited() -> None:
     assert complete_citations([a.id], "The MD-9000 is rated to -40°F.", [a, b]) == [a.id]
 
 
-def test_follow_up_reasons_keeps_the_adjacent_why_question(tmp_path, monkeypatch) -> None:
+def test_related_sub_chunks_pulls_all_models_with_hydraulic_or_air_powered(
+    tmp_path, monkeypatch
+) -> None:
+    all_models = make_hit(
+        id="service_annual_pm_checklist::s0",
+        doc_id="service_annual_pm_checklist",
+        doc_type="service",
+        text="## Dock levelers (all models)\nInspect all hinge points.",
+        score=0.2,
+    )
+    hydraulic = make_hit(
+        id="service_annual_pm_checklist::s1",
+        doc_id="service_annual_pm_checklist",
+        doc_type="service",
+        text="### Hydraulic models\nCheck hydraulic fluid level.",
+        score=0.8,
+    )
+    air = make_hit(
+        id="service_annual_pm_checklist::s2",
+        doc_id="service_annual_pm_checklist",
+        doc_type="service",
+        text="### Air-powered models\nInspect the air bag.",
+        score=0.7,
+    )
+    doors = make_hit(
+        id="service_annual_pm_checklist::s3",
+        doc_id="service_annual_pm_checklist",
+        doc_type="service",
+        text="## Industrial doors\nClean and align photo-eyes.",
+        score=0.1,
+    )
+    monkeypatch.setattr(
+        "mka.ask.store.query",
+        lambda cfg, vector, filter, top_k: [all_models, hydraulic, air, doors],
+    )
+    out = related_sub_chunks(make_config(tmp_path), "technician", [0.1], [hydraulic])
+    assert [hit.id for hit in out] == [hydraulic.id, all_models.id, air.id]
+
+
+def test_related_sub_chunks_pulls_same_family_from_the_document(tmp_path, monkeypatch) -> None:
     recommendation = make_hit(
         id="faq_cold_storage::q0",
         doc_id="faq_cold_storage",
         doc_type="faq",
-        text=(
-            "## Q: What's your recommended configuration for a -10°F freezer dock?\n"
-            "**A:** MD-9000."
-        ),
+        text="## Q: Which leveler?\n**A:** The MD-9000 air-powered dock leveler.",
         score=0.74,
     )
-    why = make_hit(
+    hydraulic = make_hit(
         id="faq_cold_storage::q1",
         doc_id="faq_cold_storage",
         doc_type="faq",
-        text=(
-            "## Q: Why air-powered instead of hydraulic in cold storage?\n"
-            "**A:** Hydraulic fluid viscosity increases."
-        ),
+        text="## Q: Why not hydraulic?\n**A:** The MD-7000 hydraulic leveler slows down in the cold.",
         score=0.0,
     )
-    finishes = make_hit(
-        id="faq_cold_storage::q2",
+    door = make_hit(
+        id="faq_cold_storage::q4",
         doc_id="faq_cold_storage",
         doc_type="faq",
-        text="## Q: Do we need special finishes?\n**A:** Stainless.",
+        text="## Q: What about track heating?\n**A:** Heated tracks are an option on the ThermaGuard 600.",
         score=0.0,
     )
+    calls: list[dict] = []
 
-    def fake_fetch(cfg, ids):
-        del cfg
-        assert "faq_cold_storage::q1" in ids
-        return [why, finishes]
+    def fake_query(cfg, vector, filter, top_k):
+        del cfg, vector
+        calls.append(filter)
+        assert top_k == 64
+        return [recommendation, door, hydraulic]
 
-    monkeypatch.setattr("mka.ask.store.fetch", fake_fetch)
-    out = follow_up_reasons(
-        make_config(tmp_path),
-        "technician",
-        "What equipment should I specify and why?",
-        [recommendation],
-    )
-    assert [hit.id for hit in out] == [recommendation.id, why.id]
+    monkeypatch.setattr("mka.ask.store.query", fake_query)
+    out = related_sub_chunks(make_config(tmp_path), "technician", [0.1], [recommendation])
+    assert len(calls) == 1
+    assert calls[0]["$and"][-1] == {"doc_id": {"$in": ["faq_cold_storage"]}}
+    assert [hit.id for hit in out] == [recommendation.id, hydraulic.id]
     assert out[1].score == recommendation.score
 
 
-def test_follow_up_reasons_skips_a_plain_lookup(tmp_path, monkeypatch) -> None:
-    def fake_fetch(cfg, ids):
-        del cfg, ids
-        raise AssertionError("plain lookup should not fetch neighbors")
-
-    monkeypatch.setattr("mka.ask.store.fetch", fake_fetch)
-    hit = make_hit(id="faq_cold_storage::q0", doc_id="faq_cold_storage", doc_type="faq")
-    out = follow_up_reasons(
-        make_config(tmp_path), "sales", "What is the rated lifting capacity?", [hit]
+def test_related_sub_chunks_loads_every_chunked_file_in_one_query(tmp_path, monkeypatch) -> None:
+    faq = make_hit(
+        id="faq_cold_storage::q0",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="Specify the MD-9000 dock leveler.",
+        score=0.7,
     )
+    service = make_hit(
+        id="service_md7000_lip_control::s0",
+        doc_id="service_md7000_lip_control",
+        doc_type="service",
+        text="Check the MD-7000 dock leveler lip.",
+        score=0.6,
+    )
+    faq_rel = make_hit(
+        id="faq_cold_storage::q1",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="The MD-7000 hydraulic leveler slows down in the cold.",
+    )
+    service_rel = make_hit(
+        id="service_md7000_lip_control::s1",
+        doc_id="service_md7000_lip_control",
+        doc_type="service",
+        text="The hydraulic leveler lip stays out.",
+    )
+    calls: list[dict] = []
+
+    def fake_query(cfg, vector, filter, top_k):
+        del cfg, vector, top_k
+        calls.append(filter)
+        return [faq_rel, service_rel]
+
+    monkeypatch.setattr("mka.ask.store.query", fake_query)
+    out = related_sub_chunks(make_config(tmp_path), "technician", [0.1], [faq, service])
+    assert len(calls) == 1
+    assert calls[0]["$and"][-1] == {
+        "doc_id": {"$in": ["faq_cold_storage", "service_md7000_lip_control"]}
+    }
+    assert [hit.id for hit in out] == [faq.id, faq_rel.id, service.id, service_rel.id]
+
+
+def test_related_sub_chunks_does_not_cascade_from_a_relative(tmp_path, monkeypatch) -> None:
+    seed = make_hit(
+        id="faq_cold_storage::q0",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="Specify the MD-9000 dock leveler.",
+        score=0.74,
+    )
+    # Shares the seed's family, and also names a door. That door family must
+    # not pull the track-heating chunk.
+    both = make_hit(
+        id="faq_cold_storage::q1",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="The MD-9000 pairs with a ThermaGuard 600 insulated door.",
+        score=0.4,
+    )
+    door = make_hit(
+        id="faq_cold_storage::q4",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="Heated tracks are an option on the ThermaGuard 600.",
+        score=0.3,
+    )
+    monkeypatch.setattr(
+        "mka.ask.store.query",
+        lambda cfg, vector, filter, top_k: [seed, both, door],
+    )
+    out = related_sub_chunks(make_config(tmp_path), "sales", [0.1], [seed])
+    assert [hit.id for hit in out] == [seed.id, both.id]
+
+
+def test_related_sub_chunks_skips_a_chunk_with_no_catalog_family(tmp_path, monkeypatch) -> None:
+    def fake_query(cfg, vector, filter, top_k):
+        del cfg, vector, filter, top_k
+        raise AssertionError("a chunk with no catalog family should not load the file")
+
+    monkeypatch.setattr("mka.ask.store.query", fake_query)
+    hit = make_hit(
+        id="faq_cold_storage::q0",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="## Q: How often?\n**A:** Quarterly.",
+    )
+    out = related_sub_chunks(make_config(tmp_path), "sales", [0.1], [hit])
     assert out == [hit]
 
 
-def test_follow_up_reasons_hides_priced_why_from_technician(tmp_path, monkeypatch) -> None:
+def test_related_sub_chunks_skips_an_unchunked_file(tmp_path, monkeypatch) -> None:
+    def fake_query(cfg, vector, filter, top_k):
+        del cfg, vector, filter, top_k
+        raise AssertionError("a whole file is not a split procedure")
+
+    monkeypatch.setattr("mka.ask.store.query", fake_query)
+    hit = make_hit(
+        id="service_md7000_hydraulic_reset::0",
+        doc_id="service_md7000_hydraulic_reset",
+        doc_type="service",
+        text="Set the MD-7000 relief valve to 1,800 psi.",
+    )
+    out = related_sub_chunks(make_config(tmp_path), "technician", [0.1], [hit])
+    assert out == [hit]
+
+
+def test_related_sub_chunks_hides_priced_relative_from_technician(tmp_path, monkeypatch) -> None:
     recommendation = make_hit(
         id="faq_cold_storage::q0",
         doc_id="faq_cold_storage",
         doc_type="faq",
+        text="Specify the MD-9000 dock leveler.",
         score=0.7,
     )
     priced = make_hit(
         id="faq_cold_storage::q1",
         doc_id="faq_cold_storage",
         doc_type="faq",
-        text="## Q: Why this option?\n**A:** Stainless lip +$1,200.",
+        text="The MD-9000 stainless lip is +$1,200.",
     )
-    monkeypatch.setattr("mka.ask.store.fetch", lambda cfg, ids: [priced])
-    out = follow_up_reasons(
-        make_config(tmp_path),
-        "technician",
-        "Which leveler should I specify and why?",
-        [recommendation],
-    )
+    monkeypatch.setattr("mka.ask.store.query", lambda cfg, vector, filter, top_k: [priced])
+    out = related_sub_chunks(make_config(tmp_path), "technician", [0.1], [recommendation])
     assert [hit.id for hit in out] == [recommendation.id]
+
+
+def test_related_sub_chunks_pulls_service_chunks_in_the_same_family(tmp_path, monkeypatch) -> None:
+    lip = make_hit(
+        id="service_md7000_lip_control::s0",
+        doc_id="service_md7000_lip_control",
+        doc_type="service",
+        text="## Symptom: Lip will not extend\nCheck the MD-7000 dock leveler.",
+        score=0.8,
+    )
+    retract = make_hit(
+        id="service_md7000_lip_control::s1",
+        doc_id="service_md7000_lip_control",
+        doc_type="service",
+        text="## Symptom: Lip will not retract\nThe hydraulic leveler lip stays out.",
+        score=0.0,
+    )
+    door = make_hit(
+        id="service_md7000_lip_control::s2",
+        doc_id="service_md7000_lip_control",
+        doc_type="service",
+        text="## Symptom: Door will not open\nAlign the RapidRoll photo-eye.",
+        score=0.0,
+    )
+    calls: list[int] = []
+
+    def fake_query(cfg, vector, filter, top_k):
+        del cfg, vector, filter
+        calls.append(top_k)
+        return [door, retract, lip]
+
+    monkeypatch.setattr("mka.ask.store.query", fake_query)
+    out = related_sub_chunks(make_config(tmp_path), "technician", [0.1], [lip])
+    assert calls == [64]
+    assert [hit.id for hit in out] == [lip.id, retract.id]
+    assert out[1].score == lip.score
 
 
 WHY = (

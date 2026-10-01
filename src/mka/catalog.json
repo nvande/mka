@@ -18,8 +18,11 @@
         "dock boards",
         "mechanical leveler",
         "hydraulic leveler",
+        "hydraulic",
         "air-powered leveler",
         "air powered leveler",
+        "air-powered",
+        "air powered",
         "pneumatic leveler",
         "air bag leveler",
         "pit leveler"
@@ -90,5 +93,6 @@
     { "term": "air bag", "family": "dock leveler" },
     { "term": "airbag", "family": "dock leveler" },
     { "term": "velocity fuse", "family": "dock leveler" }
-  ]
+  ],
+  "universal": ["electrical"]
 }
