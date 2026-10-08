@@ -181,13 +181,13 @@ def catalog_hint(query: str) -> str:
     labels = ", ".join(f"{term} → {family}" for term, family in matched)
     return (
         f"{query}\n\n"
-        f"Catalog terms in this query (treat as Meridian products): {labels}"
+        f"Catalog terms in this query (treat as documented products): {labels}"
     )
 
 
 def scope_glossary() -> str:
     lines = [
-        "These words refer to our products even if the user does not say Meridian or a model number:"
+        "These words refer to our products even if the user does not use a catalog name:"
     ]
     for family in FAMILIES:
         models = f" ({', '.join(family.models)})" if family.models else ""

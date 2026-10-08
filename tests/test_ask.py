@@ -23,7 +23,7 @@ from mka.ask import (
     complete_citations,
     explain_refuse,
     related_sub_chunks,
-    include_documented_cause,
+    note_is_grounded,
     format_refuse,
     outdated_note,
     pinecone_filter,
@@ -41,15 +41,21 @@ from conftest import make_config
 
 class FakeChat:
     def __init__(
-        self, reply: str | BaseException, support_reply: str | BaseException = "Supported"
+        self,
+        reply: str | BaseException,
+        support_reply: str | BaseException = "Supported",
+        note_reply: str | BaseException = "Ungrounded",
     ) -> None:
         self.reply = reply
         self.support_reply = support_reply
+        self.note_reply = note_reply
         self.calls: list[tuple[str, str, bool]] = []
         self.scope: list[str] = []
         self.scope_instructions: list[str] = []
         self.support: list[str] = []
         self.support_instructions: list[str] = []
+        self.notes: list[str] = []
+        self.note_instructions: list[str] = []
 
     def classify(self, text: str, *, instructions: str, choices: list[dict]) -> str:
         if _is_support(choices):
@@ -58,6 +64,12 @@ class FakeChat:
             if isinstance(self.support_reply, BaseException):
                 raise self.support_reply
             return self.support_reply
+        if _is_note(choices):
+            self.notes.append(text)
+            self.note_instructions.append(instructions)
+            if isinstance(self.note_reply, BaseException):
+                raise self.note_reply
+            return self.note_reply
         self.scope.append(text)
         self.scope_instructions.append(instructions)
         if isinstance(self.reply, BaseException):
@@ -77,6 +89,7 @@ class ScriptedChat:
         replies: dict[str, str | BaseException],
         scope_label: str = "ALLOW OTHER",
         support_label: str | BaseException = "Supported",
+        note_label: str | BaseException = "Ungrounded",
     ) -> None:
         self.replies = replies
         self.calls: list[tuple[str, str, bool]] = []
@@ -84,6 +97,8 @@ class ScriptedChat:
         self.scope_label = scope_label
         self.support: list[str] = []
         self.support_label = support_label
+        self.notes: list[str] = []
+        self.note_label = note_label
 
     def classify(self, text: str, *, instructions: str, choices: list[dict]) -> str:
         del instructions
@@ -92,6 +107,11 @@ class ScriptedChat:
             if isinstance(self.support_label, BaseException):
                 raise self.support_label
             return self.support_label
+        if _is_note(choices):
+            self.notes.append(text)
+            if isinstance(self.note_label, BaseException):
+                raise self.note_label
+            return self.note_label
         self.scope.append(text)
         return self.scope_label
 
@@ -133,6 +153,10 @@ def make_hit(**over: object) -> Hit:
 
 def _is_support(choices: list[dict]) -> bool:
     return {choice.get("value") for choice in choices} >= {"Supported", "Unsupported"}
+
+
+def _is_note(choices: list[dict]) -> bool:
+    return {choice.get("value") for choice in choices} >= {"Grounded", "Ungrounded"}
 
 
 def systems(chat) -> list[str]:
@@ -250,15 +274,17 @@ def test_scope_instructions_allow_broad_product_asks() -> None:
 
 
 def test_decide_and_generate_treat_conflict_as_answer() -> None:
-    assert "conflicting values" in DECIDE_SYS
-    assert "Do not REFUSE only because two documents disagree" in DECIDE_SYS
-    assert "Absence is not a negative answer" in DECIDE_SYS
+    assert "conflicting evidence" in DECIDE_SYS
+    assert "report the disagreement rather than select a value" in DECIDE_SYS
+    assert "absence of a statement as a definite negative" in DECIDE_SYS
     assert "flagged_outdated" in GEN_SYS
-    assert "do not mention outdated or superseded documents in the answer" in GEN_SYS
+    assert "Do not use information from chunks where flagged_outdated is true" in GEN_SYS
     assert '"outdated_note": string|null' in GEN_SYS
-    assert "do not pick a winner" in GEN_SYS
-    assert "Cite every provided chunk that states a product you named" in GEN_SYS
-    assert "disagree on the same fact" in REFUSE_SYS
+    assert "do not select one value" in GEN_SYS
+    assert "Cite every chunk that directly supports a fact" in GEN_SYS
+    assert "disagree about the same fact" in REFUSE_SYS
+    assert "air-powered" not in GEN_SYS
+    assert "hydraulic" not in GEN_SYS.lower()
 
 
 def test_answer_supported_sends_the_answer_and_cited_chunks() -> None:
@@ -540,19 +566,45 @@ def test_outdated_note_rules() -> None:
     legacy = make_hit(**LEGACY)
     # No superseded hit: the model's note is dropped, whatever it says.
     assert outdated_note("The old spec lists 30,000 lbs.", []) is None
-    # Grounded numbers: the model's sentence is used.
+    # An accepted sentence is used as given.
     assert (
         outdated_note("The superseded 2021-03 revision lists 30,000 lbs.", [legacy])
         == "The superseded 2021-03 revision lists 30,000 lbs."
     )
-    # A number the superseded text does not contain: canned line instead.
-    canned = outdated_note("The old revision lists 25,000 lbs.", [legacy])
+    # No accepted sentence: canned line. Whether a sentence is acceptable is a decision.
+    canned = outdated_note(None, [legacy])
     assert canned.startswith("Note: a superseded revision is also on file")
     assert "MD-7000 Specification (SUPERSEDED) (docs/spec_md7000_legacy.md)" in canned
-    assert "25,000" not in canned
-    # No sentence from the model: canned line.
-    assert outdated_note(None, [legacy]) == canned
     assert outdated_note("   ", [legacy]) == canned
+
+
+def test_note_is_grounded_fail_closed() -> None:
+    legacy = make_hit(**LEGACY)
+    chat = FakeChat("DENY", note_reply="Grounded")
+    assert note_is_grounded(chat, "The old spec lists 30,000 lbs.", [legacy])
+    sent = chat.notes[0]
+    assert "Note:\nThe old spec lists 30,000 lbs." in sent
+    assert "30,000 lbs" in sent
+    assert legacy.title in sent
+    assert "every factual claim" in chat.note_instructions[0]
+    assert not note_is_grounded(
+        FakeChat("DENY", note_reply="Ungrounded"), "lists 25,000 lbs.", [legacy]
+    )
+    assert note_is_grounded(
+        FakeChat("DENY", note_reply="grounded"), "lists 30,000 lbs.", [legacy]
+    )
+    assert not note_is_grounded(
+        FakeChat("DENY", note_reply="Grounded."), "lists 30,000 lbs.", [legacy]
+    )
+    assert not note_is_grounded(
+        FakeChat("DENY", note_reply="Grounded extra"), "lists 30,000 lbs.", [legacy]
+    )
+    with pytest.raises(RuntimeError, match="boom"):
+        note_is_grounded(
+            FakeChat("DENY", note_reply=RuntimeError("boom")),
+            "lists 30,000 lbs.",
+            [legacy],
+        )
 
 
 def test_run_ask_superseded_revision_always_gets_a_note_and_source(tmp_path, capsys) -> None:
@@ -574,6 +626,7 @@ def test_run_ask_superseded_revision_always_gets_a_note_and_source(tmp_path, cap
     )
     out = capsys.readouterr().out
     assert code == 0
+    assert chat.notes == []
     assert "35,000 lbs." in out
     assert "Note: a superseded revision is also on file" in out
     assert f"- MD-7000 Specification (SUPERSEDED) (docs/spec_md7000_legacy.md, {legacy.id})" in out
@@ -630,7 +683,8 @@ def test_run_ask_superseded_note_from_model_when_grounded(tmp_path, capsys) -> N
                 legacy.id,
                 outdated_note="The superseded 2021-03 revision lists 30,000 lbs.",
             ),
-        }
+        },
+        note_label="Grounded",
     )
     code = run_ask(
         make_config(tmp_path),
@@ -645,6 +699,37 @@ def test_run_ask_superseded_note_from_model_when_grounded(tmp_path, capsys) -> N
     assert "Note: a superseded revision" not in out
     # Cited once, not duplicated by the superseded append.
     assert out.count(legacy.id) == 1
+    assert "30,000 lbs" in chat.notes[0]
+    assert legacy.text in chat.notes[0]
+
+
+def test_run_ask_ungrounded_outdated_note_uses_the_canned_line(tmp_path, capsys) -> None:
+    current = make_hit()
+    legacy = make_hit(**LEGACY)
+    chat = ScriptedChat(
+        {
+            DECIDE_SYS: "ANSWER",
+            GEN_SYS: gen_json(
+                "35,000 lbs.",
+                current.id,
+                outdated_note="The old revision lists 25,000 lbs.",
+            ),
+        },
+        note_label="Ungrounded",
+    )
+    code = run_ask(
+        make_config(tmp_path),
+        "sales",
+        "MD-7000 capacity?",
+        chat=chat,
+        retriever=lambda query, role: [current, legacy],
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "35,000 lbs." in out
+    assert "25,000" not in out
+    assert "Note: a superseded revision is also on file" in out
+    assert legacy.text in chat.notes[0]
 
 
 def test_format_refuse_templates() -> None:
@@ -1415,63 +1500,6 @@ def test_related_sub_chunks_pulls_service_chunks_in_the_same_family(tmp_path, mo
     assert calls == [64]
     assert [hit.id for hit in out] == [lip.id, retract.id]
     assert out[1].score == lip.score
-
-
-WHY = (
-    "## Q: Why air-powered instead of hydraulic in cold storage?\n"
-    "**A:** Hydraulic fluid viscosity increases significantly at low temperatures, "
-    "slowing the MD-7000's response and stressing seals. The MD-9000 uses compressed "
-    "air, which performs consistently down to -40°F, and eliminates the risk of "
-    "hydraulic fluid contamination in food zones.\n"
-)
-
-
-def test_include_documented_cause_adds_the_omitted_mechanism() -> None:
-    why = make_hit(id="faq_cold_storage::q1", doc_id="faq_cold_storage", doc_type="faq", text=WHY)
-    draft = (
-        "Specify the MD-9000. It has no hydraulic fluid and operates down to -40°F, "
-        "so it meets the temperature requirement."
-    )
-    answer, ids = include_documented_cause(
-        "What equipment should I specify and why?",
-        draft,
-        [why],
-    )
-    assert "viscosity" in answer
-    assert answer.startswith(draft)
-    assert ids == [why.id]
-
-
-def test_include_documented_cause_finds_a_why_heading_under_the_title() -> None:
-    why = make_hit(
-        id="faq_cold_storage::2",
-        doc_id="faq_cold_storage",
-        doc_type="faq",
-        text="# FAQ: Cold Storage\n\n**Revision:** 2025-01\n\n" + WHY,
-    )
-    draft = "Specify the MD-9000. It operates down to -40°F."
-    answer, ids = include_documented_cause(
-        "What equipment should I specify and why?",
-        draft,
-        [why],
-    )
-    assert "viscosity" in answer
-    assert ids == [why.id]
-
-
-def test_include_documented_cause_leaves_a_complete_answer() -> None:
-    why = make_hit(id="faq_cold_storage::q1", doc_id="faq_cold_storage", doc_type="faq", text=WHY)
-    draft = (
-        "Specify the MD-9000 because hydraulic fluid viscosity increases significantly "
-        "at low temperatures, slowing the MD-7000 response and stressing seals."
-    )
-    answer, ids = include_documented_cause(
-        "What equipment should I specify and why?",
-        draft,
-        [why],
-    )
-    assert answer == draft
-    assert ids == []
 
 
 def test_retrieve_follow_up_pulls_missing_model_spec(tmp_path, monkeypatch) -> None:
