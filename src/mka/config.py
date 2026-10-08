@@ -28,11 +28,10 @@ class Config:
     pinecone_namespace: str
     llm_provider: str
     chat_model: str
+    decision_model: str
     embed_model: str
     embed_dim: int
     top_k: int
-    retrieve_pool: int
-    max_chunks_per_doc: int
     retrieve_floor: float
     max_query_chars: int
 
@@ -50,13 +49,14 @@ def load_config() -> Config:
         pinecone_namespace=os.getenv("PINECONE_NAMESPACE", "poc"),
         llm_provider=os.getenv("LLM_PROVIDER", "openai"),
         chat_model=os.getenv("CHAT_MODEL", "gpt-5.4-nano"),
+        # Scope classification is a fixed choice, so it uses the Decisions API
+        # model instead of a chat completion.
+        decision_model=os.getenv("DECISION_MODEL", "gpt-6-luna"),
         embed_model=os.getenv("EMBED_MODEL", "text-embedding-3-small"),
         embed_dim=int(os.getenv("EMBED_DIM", "1536")),
-        # top_k is the first-pass window after per-doc capping. retrieve_pool is
-        # how many neighbors we pull so a split FAQ cannot fill every slot.
-        top_k=int(os.getenv("TOP_K", "8")),
-        retrieve_pool=int(os.getenv("RETRIEVE_POOL", "16")),
-        max_chunks_per_doc=int(os.getenv("MAX_CHUNKS_PER_DOC", "2")),
+        # How many neighbors the first search keeps. A question can need every
+        # section of a document, so chunks are not dropped by document.
+        top_k=int(os.getenv("TOP_K", "16")),
         retrieve_floor=float(os.getenv("RETRIEVE_FLOOR", "0.20")),
         max_query_chars=int(os.getenv("MAX_QUERY_CHARS", "4000")),
     )

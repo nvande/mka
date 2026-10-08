@@ -1,59 +1,41 @@
 """The eval command. Runs every question in corpus/questions.json as both roles.
 
-Each case gets a 0–100 score from three independent checks: the expected
-sources were cited, the must-contain strings showed up, and the
-must-not-contain strings didn't. Expected sources come from questions.json,
-minus any document that role can't see. The string checks live in CHECKS
-below. The overall score is the mean of the cases.
+A grader model scores each answer from 0 to 100, the way a teacher scores a
+short assignment. The rubric is that question's expected answer summary, the
+expected sources for the role, and the grading notes. The overall score is
+the mean of the cases.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import re
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 
 from mka import usage
 from mka.ask import run_ask
 from mka.config import Config
+from mka.llm import Chat, make_chat
 from mka.types import Role, load_manifest
 
 ROLES: tuple[Role, ...] = ("sales", "technician")
 HIDDEN = {"sales": "service", "technician": "pricing"}  # doc_type a role cannot see
-_SOURCE_ID = re.compile(r", ([^,()]+)\)$")
-_ROLE_KEYS = frozenset(ROLES)
 
-# contain / avoid are substrings of the whole printed output, keyed by question
-# id. A nested sales/technician dict overrides those lists for that role.
-CHECKS: dict[str, dict] = {
-    "q1_simple_lookup": {"contain": ["40,000"]},
-    "q2_cross_doc_synthesis": {
-        "contain": ["MD-9000", "ThermaGuard 600", "RapidRoll 400"],
-    },
-    # The legacy source in Sources is guaranteed by Python; the old value in
-    # the note is the model's when grounded, so it is not asserted here.
-    "q3_contradiction_handling": {"contain": ["35,000"]},
-    "q4_unanswerable": {"contain": ["enough information"], "avoid": ["Sources:"]},
-    "q5_role_scoped": {
-        "sales": {"contain": ["$10,550"]},
-        "technician": {"contain": ["restricted to sales"], "avoid": ["$"]},
-    },
-    "q6_procedural_detail": {"contain": ["1,800"]},
-    "q7_near_miss_boundary": {
-        "contain": ["MD-9000"],
-        "avoid": ["outdated"],
-    },
-}
+GRADER_SYS = """You are a grader scoring a class assignment.
+Read the question, the assistant's answer, the expected answer summary, the expected sources, and the grading notes.
+Give the answer a score from 0 to 100 for how closely it meets the grading notes.
+Use the expected answer summary and the expected sources as the criteria next to those notes.
+0 means the answer misses the assignment. 100 means it meets the assignment.
+The expected sources list already leaves out documents this role cannot see. Do not mark the answer down for omitting those.
+Reply with a JSON object and nothing else: {"score": <integer 0-100>, "reason": "<one sentence>"}
+"""
 
 
 @dataclass(frozen=True)
 class Grade:
     score: int
-    earned: int
-    possible: int
-    problems: list[str]
+    reason: str
 
 
 def run_eval(cfg: Config, *, stats: bool = False) -> int:
@@ -63,65 +45,98 @@ def run_eval(cfg: Config, *, stats: bool = False) -> int:
 def _run_eval(cfg: Config) -> int:
     questions = json.loads((cfg.corpus_dir / "questions.json").read_text(encoding="utf-8"))
     doc_type = {row.doc_id: row.doc_type for row in load_manifest(cfg.corpus_dir)}
+    chat = make_chat(cfg)
     grades: list[Grade] = []
     for q in questions["questions"]:
         for role in ROLES:
-            result = grade(cfg, q, role, doc_type)
+            result = grade(cfg, q, role, doc_type, chat)
             grades.append(result)
             line = f"{q['id']} [{role}]  {result.score:3d}"
-            if result.problems:
-                line += "  " + "; ".join(result.problems)
+            if result.reason:
+                line += "  " + result.reason
             print(line)
     overall = round(sum(item.score for item in grades) / len(grades)) if grades else 0
     print(f"score: {overall}")
     return 0 if overall == 100 else 1
 
 
-def grade(cfg: Config, q: dict, role: Role, doc_type: dict[str, str]) -> Grade:
-    checks = _checks_for(q["id"], role)
-    expected = q.get(f"expected_sources_{role}", q.get("expected_sources", []))
-    expected = [doc for doc in expected if doc_type.get(doc) != HIDDEN[role]]
-    out = ask_capture(cfg, role, q["query"])
-    return score_output(out, expected, checks.get("contain", []), checks.get("avoid", []))
-
-
-def score_output(
-    out: str,
-    expected: list[str],
-    contain: list[str],
-    avoid: list[str],
+def grade(
+    cfg: Config,
+    q: dict,
+    role: Role,
+    doc_type: dict[str, str],
+    chat: Chat | None = None,
 ) -> Grade:
-    cited = {sid.split("::")[0] for sid in cited_ids(out)}
-    problems: list[str] = []
-    earned = 0
-    possible = len(expected) + len(contain) + len(avoid)
-    for doc in expected:
-        if doc in cited:
-            earned += 1
-        else:
-            problems.append(f"missing source {doc}")
-    for text in contain:
-        if text in out:
-            earned += 1
-        else:
-            problems.append(f"missing text {text!r}")
-    for text in avoid:
-        if text not in out:
-            earned += 1
-        else:
-            problems.append(f"forbidden text {text!r}")
-    score = 100 if possible == 0 else round(100 * earned / possible)
-    return Grade(score, earned, possible, problems)
+    chat = chat or make_chat(cfg)
+    return judge(
+        chat,
+        role=role,
+        query=q["query"],
+        answer=ask_capture(cfg, role, q["query"]),
+        summary=str(q.get("expected_answer_summary") or ""),
+        sources=_sources_for(q, role, doc_type),
+        notes=str(q.get("grading_notes") or ""),
+    )
 
 
-def _checks_for(qid: str, role: Role) -> dict:
-    row = dict(CHECKS.get(qid, {}))
-    overlay = row.pop(role, None) if role in row else None
-    for key in _ROLE_KEYS:
-        row.pop(key, None)
-    if isinstance(overlay, dict):
-        row.update(overlay)
-    return row
+def judge(
+    chat: Chat,
+    *,
+    role: str,
+    query: str,
+    answer: str,
+    summary: str,
+    sources: list[str],
+    notes: str,
+) -> Grade:
+    raw = chat.complete(
+        system=GRADER_SYS,
+        user=_grader_user(role, query, answer, summary, sources, notes),
+        json_object=True,
+    )
+    return _parse_grade(raw)
+
+
+def _sources_for(q: dict, role: Role, doc_type: dict[str, str]) -> list[str]:
+    expected = q.get(f"expected_sources_{role}", q.get("expected_sources", []))
+    return [doc for doc in expected if doc_type.get(doc) != HIDDEN[role]]
+
+
+def _grader_user(
+    role: str,
+    query: str,
+    answer: str,
+    summary: str,
+    sources: list[str],
+    notes: str,
+) -> str:
+    listed = "\n".join(f"- {doc}" for doc in sources) or "(none)"
+    return (
+        f"Role: {role}\n"
+        f"Question: {query}\n\n"
+        f"Expected answer summary:\n{summary or '(none)'}\n\n"
+        f"Expected sources for this role:\n{listed}\n\n"
+        f"Grading notes:\n{notes or '(none)'}\n\n"
+        f"Assistant answer:\n{answer}"
+    )
+
+
+def _parse_grade(raw: str) -> Grade:
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return Grade(0, "grader returned an unreadable score")
+    if not isinstance(data, dict):
+        return Grade(0, "grader returned an unreadable score")
+    reason = " ".join(str(data.get("reason") or "").split())
+    score = data.get("score")
+    # bool is an int subclass and is not a score.
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return Grade(0, reason or "grader returned an unreadable score")
+    score_i = round(score)
+    if score_i < 0 or score_i > 100:
+        return Grade(0, reason or "grader returned a score outside 0-100")
+    return Grade(score_i, reason)
 
 
 def ask_capture(cfg: Config, role: Role, query: str) -> str:
@@ -131,11 +146,3 @@ def ask_capture(cfg: Config, role: Role, query: str) -> str:
     with redirect_stdout(buffer):
         run_ask(cfg, role, query)
     return buffer.getvalue()
-
-
-def cited_ids(out: str) -> list[str]:
-    # Sources lines look like: - {title} ({path}, {chunk_id})
-    if "Sources:" not in out:
-        return []
-    tail = out.split("Sources:", 1)[1]
-    return [m.group(1) for line in tail.splitlines() if (m := _SOURCE_ID.search(line))]

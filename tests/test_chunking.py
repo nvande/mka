@@ -1,15 +1,11 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
-from mka.chunking import (
-    ChunkError,
-    _Piece,
-    _fit_size,
-    chunk_document,
-)
+from mka.chunking import ChunkError, chunk_document
 from mka.types import ManifestRow
 
 QA_DOC = """# FAQ: Cold Storage
@@ -51,16 +47,6 @@ STAPLED_H1 = """# First title
 Body.
 """
 
-STAPLED_REVISION = """# Title
-
-**Revision:** 2025-01
-
-Revision: 2024-01
-
-Body.
-"""
-
-
 def _row(**overrides: object) -> ManifestRow:
     fields: dict = {
         "doc_id": "faq_cold_storage",
@@ -86,29 +72,22 @@ def test_metadata_starts_with_an_empty_warning_cache() -> None:
     assert meta["warning_audiences"] == []
 
 
-def test_qa_shape_drops_preamble_and_numbers_questions() -> None:
+def test_questions_keep_the_title_and_stay_isolated() -> None:
     chunks = chunk_document(_row(), QA_DOC)
     assert [chunk.id for chunk in chunks] == [
-        "faq_cold_storage::q0",
-        "faq_cold_storage::q1",
-        "faq_cold_storage::q2",
-        "faq_cold_storage::q3",
+        "faq_cold_storage::1",
+        "faq_cold_storage::2",
+        "faq_cold_storage::3",
+        "faq_cold_storage::4",
     ]
-    assert all(chunk.text.startswith("## Q:") for chunk in chunks)
-    assert not any(chunk.text.startswith("# FAQ") for chunk in chunks)
+    assert all(chunk.text.startswith("# FAQ: Cold Storage") for chunk in chunks)
+    assert all("**Revision:** 2025-01" in chunk.text for chunk in chunks)
+    assert all(chunk.text.count("## Q:") == 1 for chunk in chunks)
+    assert "Why air-powered" not in chunks[0].text
+    assert "Why air-powered" in chunks[1].text
+    assert "recommended configuration" not in chunks[1].text
     assert chunks[2].metadata["title"] == "FAQ: Cold Storage"
     assert chunks[2].metadata["parent_title"] == "FAQ: Cold Storage"
-
-
-def test_qa_pricing_only_on_stainless_lip_question() -> None:
-    chunks = chunk_document(_row(), QA_DOC)
-    flags = {chunk.id: chunk.metadata["contains_pricing"] for chunk in chunks}
-    assert flags == {
-        "faq_cold_storage::q0": False,
-        "faq_cold_storage::q1": False,
-        "faq_cold_storage::q2": True,
-        "faq_cold_storage::q3": False,
-    }
 
 
 def test_table_faq_is_one_whole_file_chunk() -> None:
@@ -118,17 +97,11 @@ def test_table_faq_is_one_whole_file_chunk() -> None:
     assert chunks[0].id == "faq_warranty::0"
     assert chunks[0].text.startswith("# FAQ: Warranty Coverage")
     assert "## Dock levelers" in chunks[0].text
-    assert chunks[0].metadata["contains_pricing"] is False
 
 
 def test_staple_extra_h1_fails() -> None:
     with pytest.raises(ChunkError, match="H1"):
         chunk_document(_row(), STAPLED_H1)
-
-
-def test_staple_extra_revision_fails() -> None:
-    with pytest.raises(ChunkError, match="Revision"):
-        chunk_document(_row(), STAPLED_REVISION)
 
 
 def test_oversize_without_headings_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -139,19 +112,40 @@ def test_oversize_without_headings_fails(monkeypatch: pytest.MonkeyPatch) -> Non
         chunk_document(_row(doc_id="spec_x"), "# Title\n\n**Revision:** 2025-01\n\nword word word\n")
 
 
-def test_oversize_splits_on_existing_h2(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mka.chunking as chunking
-
-    def token_len(text: str) -> int:
-        return 100 if "## One" in text and "## Two" in text else 5
-
-    monkeypatch.setattr(chunking, "token_len", token_len)
-    monkeypatch.setattr(chunking, "MAX_EMBED_TOKENS", 50)
+def test_sibling_sections_keep_the_title_and_front_matter() -> None:
     text = "# Title\n\n**Revision:** 2025-01\n\n## One\nshort\n\n## Two\nshort\n"
     chunks = chunk_document(_row(doc_id="spec_x"), text)
-    assert [chunk.id for chunk in chunks] == ["spec_x::0", "spec_x::1", "spec_x::2"]
-    assert any(chunk.text.startswith("## One") for chunk in chunks)
-    assert any(chunk.text.startswith("## Two") for chunk in chunks)
+    assert [chunk.id for chunk in chunks] == ["spec_x::1", "spec_x::2"]
+    assert all(chunk.text.startswith("# Title") for chunk in chunks)
+    assert all("**Revision:** 2025-01" in chunk.text for chunk in chunks)
+    assert "## One" in chunks[0].text and "## Two" not in chunks[0].text
+    assert "## Two" in chunks[1].text and "## One" not in chunks[1].text
+
+
+def test_fenced_headings_do_not_split_the_outline() -> None:
+    text = """# Title
+
+**Revision:** 2025-01
+
+## One
+
+```
+# Second title
+## Fake
+```
+
+alpha
+
+## Two
+beta
+"""
+    chunks = chunk_document(_row(doc_id="fenced"), text)
+    assert [chunk.id for chunk in chunks] == ["fenced::1", "fenced::2"]
+    assert "## Fake" in chunks[0].text
+    assert "beta" not in chunks[0].text
+    assert "## One" not in chunks[1].text
+    assert chunks[1].text.startswith("# Title")
+    assert "**Revision:**" in chunks[1].text
 
 
 LIP_CONTROL = """# Service Procedure: MD-7000 Lip Control Troubleshooting
@@ -210,6 +204,9 @@ Annual PM is required to maintain warranty coverage.
 ### Hydraulic models (MD-7000)
 - Check hydraulic fluid level
 
+### Air-powered models (MD-9000)
+- Inspect the air bag
+
 ## Industrial doors
 - Inspect lift cables
 
@@ -237,6 +234,12 @@ SINGLE_PROCEDURE = """# Service Procedure: MD-7000 Hydraulic Pressure Reset
 ## Procedure
 ### Step 1 — Isolate power
 Engage the dock leveler disconnect.
+
+### Step 2 — Locate the relief valve
+The relief valve is on the power unit.
+
+### Step 6 — Tighten locknut
+Torque the locknut.
 
 ## Safety limits
 - Never exceed 2,100 psi.
@@ -271,33 +274,37 @@ def _service_row(doc_id: str, **overrides: object) -> ManifestRow:
     )
 
 
-def test_service_symptoms_staple_preamble_and_related_parts() -> None:
+def test_sibling_sections_pull_down_the_title_not_each_other() -> None:
     chunks = chunk_document(_service_row("service_md7000_lip_control"), LIP_CONTROL)
     assert [chunk.id for chunk in chunks] == [
-        "service_md7000_lip_control::s0",
-        "service_md7000_lip_control::s1",
-        "service_md7000_lip_control::s2",
-        "service_md7000_lip_control::s3",
+        "service_md7000_lip_control::1",
+        "service_md7000_lip_control::2",
+        "service_md7000_lip_control::3",
+        "service_md7000_lip_control::4",
+        "service_md7000_lip_control::5",
     ]
+    assert all(chunk.text.startswith("# Service Procedure: MD-7000 Lip Control") for chunk in chunks)
     assert all("**Equipment:**" in chunk.text for chunk in chunks)
-    assert all("## Related parts" in chunk.text for chunk in chunks)
-    assert all("MD7-LCS-12" in chunk.text for chunk in chunks)
     assert all(chunk.metadata["parent_title"] == "service_md7000_lip_control" for chunk in chunks)
     assert chunks[0].text.count("## Symptom:") == 1
     assert "Lip will not extend" in chunks[0].text
     assert "Lip will not retract" not in chunks[0].text
+    assert "## Related parts" not in chunks[0].text
     assert "Lip will not retract" in chunks[1].text
     assert "Lip will not extend" not in chunks[1].text
+    assert "## Related parts" in chunks[-1].text
+    assert "MD7-LCS-12" in chunks[-1].text
+    assert "Lip will not extend" not in chunks[-1].text
 
 
-def test_service_faults_keep_preamble_and_isolate_codes() -> None:
+def test_nested_sections_keep_the_parent_heading() -> None:
     chunks = chunk_document(_service_row("service_dockguard_diagnostics"), DOCKGUARD)
     assert [chunk.id for chunk in chunks] == [
-        "service_dockguard_diagnostics::s0",
-        "service_dockguard_diagnostics::s1",
-        "service_dockguard_diagnostics::s2",
-        "service_dockguard_diagnostics::s3",
-        "service_dockguard_diagnostics::s4",
+        "service_dockguard_diagnostics::1",
+        "service_dockguard_diagnostics::2",
+        "service_dockguard_diagnostics::3",
+        "service_dockguard_diagnostics::4",
+        "service_dockguard_diagnostics::5",
     ]
     assert all("**Equipment:**" in chunk.text for chunk in chunks)
     assert all("## Fault code reference" in chunk.text for chunk in chunks)
@@ -307,86 +314,109 @@ def test_service_faults_keep_preamble_and_isolate_codes() -> None:
     assert "No trailer detected" not in chunks[1].text
 
 
-def test_service_pm_topics_share_purpose_and_documentation() -> None:
+def test_parent_prose_stays_its_own_chunk_and_children_keep_the_heading() -> None:
     chunks = chunk_document(_service_row("service_annual_pm_checklist"), PM_CHECKLIST)
-    assert [chunk.id for chunk in chunks] == [
-        "service_annual_pm_checklist::s0",
-        "service_annual_pm_checklist::s1",
-        "service_annual_pm_checklist::s2",
-        "service_annual_pm_checklist::s3",
-        "service_annual_pm_checklist::s4",
-    ]
-    assert all("## Purpose" in chunk.text for chunk in chunks)
-    assert all("## Documentation" in chunk.text for chunk in chunks)
-    assert "Dock levelers" in chunks[0].text
-    assert "Hydraulic models" not in chunks[0].text
-    assert "Hydraulic models" in chunks[1].text
-    assert "Industrial doors" in chunks[2].text
-    assert "Vehicle restraints" in chunks[3].text
-    assert "Electrical" in chunks[4].text
+    assert len(chunks) == 8
+    assert all("**Frequency:**" in chunk.text for chunk in chunks)
+    purpose = next(chunk for chunk in chunks if "## Purpose" in chunk.text)
+    assert "Hydraulic models" not in purpose.text
+    assert "## Documentation" not in purpose.text
+    levelers = next(chunk for chunk in chunks if "Inspect all hinge points" in chunk.text)
+    assert "## Dock levelers (all models)" in levelers.text
+    assert "Hydraulic models" not in levelers.text
+    hydraulic = next(chunk for chunk in chunks if "### Hydraulic models" in chunk.text)
+    assert "## Dock levelers (all models)" in hydraulic.text
+    assert "Inspect all hinge points" not in hydraulic.text
+    assert "Air-powered" not in hydraulic.text
+    doors = next(chunk for chunk in chunks if "Inspect lift cables" in chunk.text)
+    assert "## Industrial doors" in doors.text
+    assert "## Documentation" in chunks[-1].text
+    assert "warranty coverage" not in chunks[-1].text
 
 
-def test_single_procedure_service_file_stays_one_chunk() -> None:
+def test_numbered_steps_stay_with_their_parent_section() -> None:
     chunks = chunk_document(_service_row("service_md7000_hydraulic_reset"), SINGLE_PROCEDURE)
-    assert [chunk.id for chunk in chunks] == ["service_md7000_hydraulic_reset::0"]
-    assert "## Procedure" in chunks[0].text
-    assert "## Safety limits" in chunks[0].text
+    procedure = next(chunk for chunk in chunks if "### Step 1" in chunk.text)
+    assert "### Step 6" in procedure.text
+    assert "## Safety limits" not in procedure.text
+    assert "## Required tools" not in procedure.text
+    safety = next(chunk for chunk in chunks if "## Safety limits" in chunk.text)
+    assert safety.text.startswith("# Service Procedure: MD-7000 Hydraulic Pressure Reset")
+    assert "**Revision:**" in safety.text
+    assert "Step 1" not in safety.text
+    assert [chunk.id for chunk in chunks] == [
+        "service_md7000_hydraulic_reset::1",
+        "service_md7000_hydraulic_reset::2",
+        "service_md7000_hydraulic_reset::3",
+        "service_md7000_hydraulic_reset::4",
+        "service_md7000_hydraulic_reset::5",
+    ]
 
 
-def test_spec_with_several_h2_stays_whole_file() -> None:
-    chunks = chunk_document(_row(doc_id="spec_multi", doc_type="spec"), SPEC_WITH_TOPICS)
-    assert [chunk.id for chunk in chunks] == ["spec_multi::0"]
-    assert "## Dock levelers" in chunks[0].text
-    assert "## Vehicle restraints" in chunks[0].text
+def test_outline_split_ignores_doc_type() -> None:
+    spec = chunk_document(_row(doc_id="spec_multi", doc_type="spec"), SPEC_WITH_TOPICS)
+    service = chunk_document(_row(doc_id="spec_multi", doc_type="service"), SPEC_WITH_TOPICS)
+    assert [chunk.id for chunk in spec] == ["spec_multi::1", "spec_multi::2", "spec_multi::3"]
+    assert [chunk.text for chunk in spec] == [chunk.text for chunk in service]
+    assert "## Dock levelers" in spec[0].text
+    assert "## Industrial doors" not in spec[0].text
+    assert "## Vehicle restraints" in spec[2].text
+    assert all(chunk.text.startswith("# Product spec") for chunk in spec)
+    assert all("**Revision:**" in chunk.text for chunk in spec)
 
 
-def test_one_symptom_stays_whole_file() -> None:
+def test_one_section_stays_whole_file() -> None:
     text = """# Service
 
 **Revision:** 2024-08
 
 ## Symptom: Lip will not extend
 Check the harness.
-
-## Related parts
-- MD7-LCS-12
 """
     chunks = chunk_document(_service_row("service_one_symptom"), text)
     assert [chunk.id for chunk in chunks] == ["service_one_symptom::0"]
+    assert "## Symptom: Lip will not extend" in chunks[0].text
+    assert "**Revision:**" in chunks[0].text
 
 
-def test_oversize_service_issue_restaples_preamble_and_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_oversize_sequence_splits_under_the_parent_heading(monkeypatch: pytest.MonkeyPatch) -> None:
     import mka.chunking as chunking
 
     def token_len(text: str) -> int:
-        return 100 if "## One" in text and "## Two" in text else 5
+        return 100 if "Step 1" in text and "Step 2" in text else 5
 
     monkeypatch.setattr(chunking, "token_len", token_len)
     monkeypatch.setattr(chunking, "MAX_EMBED_TOKENS", 50)
-    row = _service_row("service_big")
-    piece = _Piece(
-        "service_big::s0",
-        "**Equipment:** MD-7000\n## One\nshort\n## Two\nshort\n## Related parts\nkits\n",
-        "**Equipment:** MD-7000\n",
-        "## Related parts\nkits\n",
-    )
-    chunks = _fit_size(row, piece)
-    assert [chunk.id for chunk in chunks] == ["service_big::s0::0", "service_big::s0::1"]
-    assert all("**Equipment:**" in chunk.text for chunk in chunks)
-    assert all("## Related parts" in chunk.text for chunk in chunks)
-    assert "## Two" not in chunks[0].text
-    assert "## One" not in chunks[1].text
+    text = """# Title
+
+**Revision:** 2025-01
+
+## Procedure
+
+### Step 1 — A
+short
+
+### Step 2 — B
+short
+"""
+    chunks = chunk_document(_row(doc_id="spec_x"), text)
+    assert [chunk.id for chunk in chunks] == ["spec_x::1", "spec_x::2"]
+    assert all(chunk.text.startswith("# Title") for chunk in chunks)
+    assert all("**Revision:**" in chunk.text for chunk in chunks)
+    assert all("## Procedure" in chunk.text for chunk in chunks)
+    assert "Step 2" not in chunks[0].text
+    assert "Step 1" not in chunks[1].text
 
 
 def test_corpus_service_sanity() -> None:
     docs = Path(__file__).resolve().parents[1] / "corpus" / "docs"
     cases = [
-        ("service_md7000_lip_control.md", "service_md7000_lip_control", 4, "::s"),
-        ("service_dockguard_diagnostics.md", "service_dockguard_diagnostics", 5, "::s"),
-        ("service_annual_pm_checklist.md", "service_annual_pm_checklist", 8, "::s"),
-        ("service_md7000_hydraulic_reset.md", "service_md7000_hydraulic_reset", 1, "::0"),
-        ("service_rapidroll_photoeye.md", "service_rapidroll_photoeye", 1, "::0"),
-        ("service_thermaguard_spring.md", "service_thermaguard_spring", 1, "::0"),
+        ("service_md7000_lip_control.md", "service_md7000_lip_control", 5),
+        ("service_dockguard_diagnostics.md", "service_dockguard_diagnostics", 5),
+        ("service_annual_pm_checklist.md", "service_annual_pm_checklist", 10),
+        ("service_md7000_hydraulic_reset.md", "service_md7000_hydraulic_reset", 5),
+        ("service_rapidroll_photoeye.md", "service_rapidroll_photoeye", 3),
+        ("service_thermaguard_spring.md", "service_thermaguard_spring", 3),
     ]
     if not all((docs / name).is_file() for name, *_ in cases):
         pytest.skip("corpus not present")
@@ -395,24 +425,31 @@ def test_corpus_service_sanity() -> None:
         (docs / "service_md7000_lip_control.md").read_text(encoding="utf-8"),
     )
     assert all("**Equipment:**" in chunk.text for chunk in lip)
-    assert all("## Related parts" in chunk.text for chunk in lip)
+    assert all(chunk.text.startswith("# Service Procedure: MD-7000 Lip Control") for chunk in lip)
+    assert "## Related parts" in lip[-1].text
+    assert "## Related parts" not in lip[0].text
     dock = chunk_document(
         _service_row("service_dockguard_diagnostics"),
         (docs / "service_dockguard_diagnostics.md").read_text(encoding="utf-8"),
     )
+    assert all("## Fault code reference" in chunk.text for chunk in dock)
     assert "Hook will not extend" not in dock[0].text
     pm = chunk_document(
         _service_row("service_annual_pm_checklist"),
         (docs / "service_annual_pm_checklist.md").read_text(encoding="utf-8"),
     )
-    assert "Dock levelers" in pm[0].text
-    assert "Hydraulic models" not in pm[0].text
-    assert "Hydraulic models" in pm[1].text
-    assert "Air-powered" in pm[2].text
-    for name, doc_id, count, suffix in cases:
+    levelers = next(chunk for chunk in pm if "Inspect all hinge points" in chunk.text)
+    hydraulic = next(chunk for chunk in pm if "### Hydraulic models" in chunk.text)
+    air = next(chunk for chunk in pm if "### Air-powered models" in chunk.text)
+    assert "Hydraulic models" not in levelers.text
+    assert "## Dock levelers (all models)" in hydraulic.text
+    assert "Air-powered" not in hydraulic.text
+    assert "## Dock levelers (all models)" in air.text
+    assert all("**Frequency:**" in chunk.text for chunk in pm)
+    for name, doc_id, count in cases:
         chunks = chunk_document(
             _service_row(doc_id),
             (docs / name).read_text(encoding="utf-8"),
         )
         assert len(chunks) == count, name
-        assert all(suffix in chunk.id for chunk in chunks), name
+        assert all(re.fullmatch(rf"{doc_id}::[1-9]\d*", chunk.id) for chunk in chunks), name

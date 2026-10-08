@@ -61,7 +61,7 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser(
         "eval",
         parents=[common],
-        help="Run corpus/questions.json under both roles and print 0-100 scores",
+        help="Grade corpus/questions.json for both roles and print 0-100 scores",
     )
 
     args = parser.parse_args(argv)

@@ -1,42 +1,35 @@
-"""Split each document into chunks so it can be embedded and searched."""
+"""Split a markdown document on its heading outline.
+
+A chunk is one section. The document title, the front matter under that
+title, and every ancestor heading are copied onto the chunk, so a section
+retrieved on its own still says which document and parent it came from.
+
+Numbered steps stay with their parent heading. They are one sequence, not
+a list of topics. If that chunk is too large to embed, the steps are split
+and the parent heading is copied onto each one.
+"""
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import tiktoken
 
-from mka.pricing import contains_pricing
 from mka.types import Chunk, ManifestRow
 
 MAX_EMBED_TOKENS = 8191
 MAX_METADATA_BYTES = 40_000
 
-_H1 = re.compile(r"^# ", re.M)
-_REVISION = re.compile(r"(?i)^(\*\*Revision:\*\*|Revision:)", re.M)
-_QA_MARK = re.compile(r"^## Q:", re.M)
-_QA_SPLIT = re.compile(r"(?=^## Q:)", re.M)
-_H2_SPLIT = re.compile(r"(?=^## )", re.M)
-_H3_SPLIT = re.compile(r"(?=^### )", re.M)
-_SYMPTOM = re.compile(r"^## Symptom:", re.M)
-_FAULT = re.compile(r"^### E\d+", re.M)
-_FAULT_SPLIT = re.compile(r"(?=^### E\d+)", re.M)
-_PROCEDURE_H2 = re.compile(r"^## Procedure\b", re.M)
-
-_SHARED_H2 = frozenset(
-    {
-        "purpose",
-        "documentation",
-        "related parts",
-        "required tools",
-        "procedure",
-        "safety limits",
-        "prerequisites",
-        "critical rules",
-        "fault code reference",
-    }
+_HEADING = re.compile(r"^[ ]{0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", re.M)
+_FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})", re.M)
+_TRAILING_RULE = re.compile(r"(?:\n+[ \t]*---[ \t]*)+\Z")
+_LEADING_RULE = re.compile(r"^(?:[ \t]*---[ \t]*\n+)+")
+# "Step 1", "Part 2", "3." — an ordered sequence under one parent heading.
+_SEQUENCE = re.compile(
+    r"^(?:step|part|phase|item)\s+\d+\b|^\d+\s*[\.\)\:]|^\d+\s+[—–-]",
+    re.I,
 )
 
 _encoding: tiktoken.Encoding | None = None
@@ -46,208 +39,183 @@ class ChunkError(Exception):
     """File cannot be chunked (staple or size)."""
 
 
-@dataclass(frozen=True)
-class _Piece:
-    chunk_id: str
-    body: str
-    preamble: str = ""
-    tail: str = ""
+@dataclass
+class _Heading:
+    level: int
+    line: str
+    start: int
+    end: int
+
+
+@dataclass
+class _Node:
+    level: int
+    heading: str
+    start: int
+    body_start: int
+    end: int
+    children: list[_Node] = field(default_factory=list)
 
 
 def chunk_document(row: ManifestRow, text: str) -> list[Chunk]:
     _reject_staple(text)
+    bodies = [body for body in _emit(row, text, _tree(text), "") if body.strip()]
+    if not bodies:
+        bodies = [text]
+    multiple = len(bodies) > 1
     chunks: list[Chunk] = []
-    for piece in _split_shape(row, text):
-        chunks.extend(_fit_size(row, piece))
+    for index, body in enumerate(bodies, start=1):
+        chunk_id = f"{row.doc_id}::{index}" if multiple else f"{row.doc_id}::0"
+        chunk = _make_chunk(row, chunk_id, body)
+        if over_limit(chunk):
+            raise ChunkError(f"{chunk_id} exceeds embed or metadata size")
+        chunks.append(chunk)
     return chunks
 
 
 def _reject_staple(text: str) -> None:
     # Two documents pasted into one file must not become one vector.
-    if len(_H1.findall(text)) > 1:
+    h1 = [heading for heading in _headings(text) if heading.level == 1]
+    if len(h1) > 1:
         raise ChunkError("stapled file: more than one H1")
-    if len(_REVISION.findall(text)) > 1:
-        raise ChunkError("stapled file: more than one Revision header")
 
 
-def _split_shape(row: ManifestRow, text: str) -> list[_Piece]:
-    if _QA_MARK.search(text):
-        parts = [part for part in _QA_SPLIT.split(text) if part.startswith("## Q:")]
-        if not parts:
-            raise ChunkError(f"{row.doc_id}: Q&A shape but no questions")
-        return [_Piece(f"{row.doc_id}::q{i}", part) for i, part in enumerate(parts)]
-    for splitter in (_split_symptoms, _split_faults, _split_pm_topics):
-        pieces = splitter(row, text)
-        if pieces:
-            return pieces
-    return [_Piece(f"{row.doc_id}::0", text)]
+def _emit(row: ManifestRow, text: str, node: _Node, prefix: str) -> list[str]:
+    if _opens(node):
+        if len(node.children) == 1:
+            return _descend(row, text, node, prefix)
+        return _split_children(row, text, node, prefix)
+    return _leaf(row, text, node, prefix)
 
 
-def _split_symptoms(row: ManifestRow, text: str) -> list[_Piece] | None:
-    if len(_SYMPTOM.findall(text)) < 2:
-        return None
-    lead, sections = _h2_sections(text)
-    first = next(i for i, section in enumerate(sections) if _is_symptom(section))
-    last = max(i for i, section in enumerate(sections) if _is_symptom(section))
-    preamble = lead + "".join(sections[:first])
-    tail = "".join(sections[last + 1 :])
-    issues = [section for section in sections[first : last + 1] if _is_symptom(section)]
-    return _service_pieces(row, preamble, issues, tail)
+def _opens(node: _Node) -> bool:
+    if len(node.children) >= 2 and not _is_sequence(node.children):
+        return True
+    return len(node.children) == 1 and _contains_split(node.children[0])
 
 
-def _split_faults(row: ManifestRow, text: str) -> list[_Piece] | None:
-    if len(_FAULT.findall(text)) < 2:
-        return None
-    preamble = ""
-    faults: list[str] = []
-    for part in _FAULT_SPLIT.split(text):
-        if _FAULT.match(part):
-            faults.append(part)
-        else:
-            preamble += part
-    last = faults[-1]
-    fault_body, trailing = _h2_sections(last)
-    if trailing:
-        faults[-1] = fault_body
-        tail = "".join(trailing)
-    else:
-        tail = ""
-    return _service_pieces(row, preamble, faults, tail)
+def _contains_split(node: _Node) -> bool:
+    if len(node.children) >= 2 and not _is_sequence(node.children):
+        return True
+    return any(_contains_split(child) for child in node.children)
 
 
-def _split_pm_topics(row: ManifestRow, text: str) -> list[_Piece] | None:
-    # doc_type is required here so a spec with several ## sections stays
-    # one chunk. A "## Procedure" heading is one job, not a list of topics.
-    if row.doc_type != "service":
-        return None
-    if _PROCEDURE_H2.search(text):
-        return None
-    lead, sections = _h2_sections(text)
-    topic_indexes = [i for i, section in enumerate(sections) if not _is_shared_h2(section)]
-    if len(topic_indexes) < 2:
-        return None
-    first, last = topic_indexes[0], topic_indexes[-1]
-    preamble = lead + "".join(sections[:first])
-    tail = "".join(sections[last + 1 :])
-    issues: list[str] = []
-    current = ""
-    for section in sections[first : last + 1]:
-        if _is_shared_h2(section):
-            current += section
-            continue
-        if current:
-            issues.extend(_explode_h3(current))
-        current = section
-    if current:
-        issues.extend(_explode_h3(current))
-    return _service_pieces(row, preamble, issues, tail)
+def _descend(row: ManifestRow, text: str, node: _Node, prefix: str) -> list[str]:
+    child = node.children[0]
+    intro = text[node.body_start : child.start]
+    return _emit(row, text, child, _cat(prefix, node.heading, intro))
 
 
-def _explode_h3(section: str) -> list[str]:
-    # "Dock levelers (all models)" and "Hydraulic models" are separate chunks.
-    # A match on the model section can then pull the all-models checklist.
-    parts = [part for part in _H3_SPLIT.split(section) if part.strip()]
-    return parts or [section]
-
-
-def _service_pieces(row: ManifestRow, preamble: str, issues: list[str], tail: str) -> list[_Piece]:
-    pieces: list[_Piece] = []
-    for i, issue in enumerate(issues):
-        pieces.append(
-            _Piece(
-                f"{row.doc_id}::s{i}",
-                _join_staple(preamble, issue, tail),
-                preamble,
-                tail,
-            )
-        )
+def _split_children(row: ManifestRow, text: str, node: _Node, prefix: str) -> list[str]:
+    intro = text[node.body_start : node.children[0].start]
+    # Title and front matter are document context, not their own chunk.
+    if node.level <= 1:
+        carried = _cat(prefix, node.heading, intro)
+        pieces: list[str] = []
+        for child in node.children:
+            pieces.extend(_emit(row, text, child, carried))
+        return pieces
+    pieces = []
+    if _clean(intro):
+        own = _cat(prefix, node.heading, intro)
+        if _too_big(row, own):
+            raise ChunkError(f"{row.doc_id}: {node.heading} exceeds embed or metadata size")
+        pieces.append(own)
+    carried = _cat(prefix, node.heading)
+    for child in node.children:
+        pieces.extend(_emit(row, text, child, carried))
     return pieces
 
 
-def _h2_sections(text: str) -> tuple[str, list[str]]:
-    lead: list[str] = []
-    sections: list[str] = []
-    for part in _H2_SPLIT.split(text):
-        if part.startswith("## "):
-            sections.append(part)
-        else:
-            lead.append(part)
-    return "".join(lead), sections
+def _leaf(row: ManifestRow, text: str, node: _Node, prefix: str) -> list[str]:
+    span = text[node.body_start : node.end] if node.level == 0 else text[node.start : node.end]
+    body = _cat(prefix, span)
+    if not body.strip():
+        return []
+    if not _too_big(row, body) or not node.children:
+        if _too_big(row, body):
+            label = node.heading or "document"
+            raise ChunkError(f"{row.doc_id}: {label} exceeds embed or metadata size")
+        return [body]
+    # Kept together as a sequence, but too big to embed. Split the children
+    # and copy this heading onto each one.
+    return _split_children(row, text, node, prefix)
 
 
-def _is_symptom(section: str) -> bool:
-    return section.startswith("## Symptom:")
+def _is_sequence(children: list[_Node]) -> bool:
+    if len(children) < 2:
+        return False
+    return all(_SEQUENCE.match(_heading_title(child.heading)) for child in children)
 
 
-def _is_shared_h2(section: str) -> bool:
-    # A single "## Symptom:" inside a procedure is context for that job.
-    # The symptom splitter already ran, and it only splits when there are
-    # two or more. Treating "symptom" as shared keeps the PM splitter from
-    # cutting the procedure apart.
-    name = _h2_name(section)
-    if name in _SHARED_H2:
-        return True
-    return name.startswith("symptom")
+def _heading_title(heading: str) -> str:
+    return re.sub(r"^#{1,6}[ \t]+", "", heading).strip()
 
 
-def _h2_name(section: str) -> str:
-    line = section.split("\n", 1)[0]
-    if line.startswith("## "):
-        return line[3:].strip().lower()
-    return ""
+def _cat(*parts: str) -> str:
+    pieces = [_clean(part) for part in parts]
+    pieces = [part for part in pieces if part]
+    if not pieces:
+        return ""
+    return "\n\n".join(pieces) + "\n"
 
 
-def _join_staple(preamble: str, issue: str, tail: str) -> str:
-    return "".join(part for part in (preamble, issue, tail) if part)
+def _clean(text: str) -> str:
+    body = text.strip()
+    body = _LEADING_RULE.sub("", body)
+    body = _TRAILING_RULE.sub("", body)
+    return body.strip()
 
 
-def _fit_size(row: ManifestRow, piece: _Piece) -> list[Chunk]:
-    # Walls are the embedding model (~8191 tokens) and Pinecone's metadata
-    # cap. This corpus fits. The split exists so a glued-together file fails
-    # loudly instead of being truncated into a useless vector. Service
-    # pieces keep the same preamble and tail, so a DANGER above the first
-    # issue stays on every piece.
-    chunk = _make_chunk(row, piece.chunk_id, piece.body)
-    if not over_limit(chunk):
-        return [chunk]
-    if piece.preamble or piece.tail:
-        middle = _unstaple(piece.body, piece.preamble, piece.tail)
-        parts = [part for part in _H2_SPLIT.split(middle) if part.strip()]
-        if len(parts) <= 1:
-            raise ChunkError(f"{piece.chunk_id} exceeds embed or metadata size")
-        fitted: list[Chunk] = []
-        for i, part in enumerate(parts):
-            part_id = f"{piece.chunk_id}::{i}"
-            body = _join_staple(piece.preamble, part, piece.tail)
-            extra = _make_chunk(row, part_id, body)
-            if over_limit(extra):
-                raise ChunkError(f"{part_id} exceeds embed or metadata size")
-            fitted.append(extra)
-        return fitted
-    parts = [part for part in _H2_SPLIT.split(piece.body) if part.strip()]
-    if len(parts) <= 1:
-        raise ChunkError(f"{piece.chunk_id} exceeds embed or metadata size")
-    fitted = []
-    for i, part in enumerate(parts):
-        part_id = f"{row.doc_id}::{i}"
-        extra = _make_chunk(row, part_id, part)
-        if over_limit(extra):
-            raise ChunkError(f"{part_id} exceeds embed or metadata size")
-        fitted.append(extra)
-    return fitted
+def _tree(text: str) -> _Node:
+    root = _Node(0, "", 0, 0, len(text))
+    stack = [root]
+    for heading in _headings(text):
+        node = _Node(heading.level, heading.line, heading.start, heading.end, len(text))
+        while stack[-1].level >= node.level:
+            stack.pop()
+        stack[-1].children.append(node)
+        stack.append(node)
+    _close(root, len(text))
+    return root
 
 
-def _unstaple(body: str, preamble: str, tail: str) -> str:
-    middle = body
-    if preamble:
-        if not middle.startswith(preamble):
-            raise ChunkError("service chunk missing preamble")
-        middle = middle[len(preamble) :]
-    if tail:
-        if not middle.endswith(tail):
-            raise ChunkError("service chunk missing tail")
-        middle = middle[: len(middle) - len(tail)]
-    return middle
+def _close(node: _Node, end: int) -> None:
+    node.end = end
+    for index, child in enumerate(node.children):
+        child_end = node.children[index + 1].start if index + 1 < len(node.children) else end
+        _close(child, child_end)
+
+
+def _headings(text: str) -> list[_Heading]:
+    fenced = _fenced_ranges(text)
+    found: list[_Heading] = []
+    for match in _HEADING.finditer(text):
+        if any(start <= match.start() < end for start, end in fenced):
+            continue
+        found.append(
+            _Heading(len(match.group(1)), match.group(0).strip(), match.start(), match.end())
+        )
+    return found
+
+
+def _fenced_ranges(text: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    opener: re.Match[str] | None = None
+    for match in _FENCE.finditer(text):
+        if opener is None:
+            opener = match
+            continue
+        if match.group(1)[0] == opener.group(1)[0] and len(match.group(1)) >= len(opener.group(1)):
+            ranges.append((opener.start(), match.end()))
+            opener = None
+    if opener is not None:
+        ranges.append((opener.start(), len(text)))
+    return ranges
+
+
+def _too_big(row: ManifestRow, text: str) -> bool:
+    return over_limit(_make_chunk(row, "_", text))
 
 
 def _make_chunk(row: ManifestRow, chunk_id: str, text: str) -> Chunk:
@@ -266,8 +234,6 @@ def _metadata(row: ManifestRow, text: str) -> dict:
         "version": row.version,
         "last_updated": row.last_updated,
         "flagged_outdated": row.flagged_outdated,
-        # doc_type is not trusted. A FAQ row can still contain a price.
-        "contains_pricing": contains_pricing(text),
         # Hazard-note cache. Empty at chunk time; safety.assign_warnings
         # fills these once ingest has read the whole source file.
         "contains_warning": False,

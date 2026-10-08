@@ -60,8 +60,8 @@ def load_catalog(path: Path) -> Catalog:
     return Catalog(families, components, universal)
 
 
-# Loaded once at import: ask.py bakes scope_glossary() into its system prompt,
-# so the catalog must not change under a running process.
+# Loaded once at import: ask.py bakes scope_glossary() into the classifier
+# instructions, so the catalog must not change under a running process.
 _CATALOG = load_catalog(CATALOG_PATH)
 FAMILIES = _CATALOG.families
 COMPONENTS = _CATALOG.components

@@ -14,11 +14,12 @@ from mka.ask import (
     REFUSE,
     SUBJECTIVE,
     REFUSE_SYS,
-    SCOPE_SYS,
+    SCOPE_CHOICES,
+    SCOPE_INSTRUCTIONS,
     TRIVIAL,
     TRIVIAL_TOO_LONG,
-    cap_per_doc,
     classify_scope,
+    answer_supported,
     complete_citations,
     explain_refuse,
     related_sub_chunks,
@@ -26,11 +27,8 @@ from mka.ask import (
     format_refuse,
     outdated_note,
     pinecone_filter,
-    receipt_ok,
     retrieve,
     run_ask,
-    strip_follow_ups,
-    strip_outdated_claims,
     superseded_hits,
     trivial_reject,
 )
@@ -42,9 +40,29 @@ from conftest import make_config
 
 
 class FakeChat:
-    def __init__(self, reply: str | BaseException) -> None:
+    def __init__(
+        self, reply: str | BaseException, support_reply: str | BaseException = "Supported"
+    ) -> None:
         self.reply = reply
+        self.support_reply = support_reply
         self.calls: list[tuple[str, str, bool]] = []
+        self.scope: list[str] = []
+        self.scope_instructions: list[str] = []
+        self.support: list[str] = []
+        self.support_instructions: list[str] = []
+
+    def classify(self, text: str, *, instructions: str, choices: list[dict]) -> str:
+        if _is_support(choices):
+            self.support.append(text)
+            self.support_instructions.append(instructions)
+            if isinstance(self.support_reply, BaseException):
+                raise self.support_reply
+            return self.support_reply
+        self.scope.append(text)
+        self.scope_instructions.append(instructions)
+        if isinstance(self.reply, BaseException):
+            raise self.reply
+        return self.reply
 
     def complete(self, *, system: str, user: str, json_object: bool = False) -> str:
         self.calls.append((system, user, json_object))
@@ -54,9 +72,28 @@ class FakeChat:
 
 
 class ScriptedChat:
-    def __init__(self, replies: dict[str, str | BaseException]) -> None:
+    def __init__(
+        self,
+        replies: dict[str, str | BaseException],
+        scope_label: str = "ALLOW OTHER",
+        support_label: str | BaseException = "Supported",
+    ) -> None:
         self.replies = replies
         self.calls: list[tuple[str, str, bool]] = []
+        self.scope: list[str] = []
+        self.scope_label = scope_label
+        self.support: list[str] = []
+        self.support_label = support_label
+
+    def classify(self, text: str, *, instructions: str, choices: list[dict]) -> str:
+        del instructions
+        if _is_support(choices):
+            self.support.append(text)
+            if isinstance(self.support_label, BaseException):
+                raise self.support_label
+            return self.support_label
+        self.scope.append(text)
+        return self.scope_label
 
     def complete(self, *, system: str, user: str, json_object: bool = False) -> str:
         self.calls.append((system, user, json_object))
@@ -94,6 +131,10 @@ def make_hit(**over: object) -> Hit:
     return Hit(**data)
 
 
+def _is_support(choices: list[dict]) -> bool:
+    return {choice.get("value") for choice in choices} >= {"Supported", "Unsupported"}
+
+
 def systems(chat) -> list[str]:
     return [call[0] for call in chat.calls]
 
@@ -104,13 +145,15 @@ def only_call(chat, system: str) -> tuple[str, str, bool]:
     return matches[0]
 
 
-def assert_decided_and_drafted_together(chat, *, before: str, after: str | None) -> None:
+def assert_decided_and_drafted_together(chat, *, after: str | None) -> None:
     # Generate runs on a worker thread alongside decide, so its position is
     # unspecified. The main-thread sequence is fixed and each call runs once.
+    # Scope is a decision, not one of these chat completions.
     seen = systems(chat)
     main_thread = [system for system in seen if system != GEN_SYS]
-    assert main_thread == [before, DECIDE_SYS] + ([after] if after else [])
+    assert main_thread == [DECIDE_SYS] + ([after] if after else [])
     assert seen.count(GEN_SYS) == 1
+    assert chat.scope
 
 
 def gen_json(answer: str, *ids: str, outdated_note: str | None = None) -> str:
@@ -146,23 +189,28 @@ def test_trivial_ok() -> None:
     assert trivial_reject("What is MD-9000 capacity?", 4000) is None
 
 
-def test_scope_allow_only_exact_token() -> None:
-    chat = FakeChat("ALLOW")
-    assert classify_scope(chat, "MD-9000 capacity?") == "ALLOW"
-    assert "Catalog terms" in chat.calls[0][1]
+def test_scope_allow_only_exact_label() -> None:
+    chat = FakeChat("ALLOW OTHER")
+    assert classify_scope(chat, "MD-9000 capacity?") == "ALLOW OTHER"
+    assert "Catalog terms" in chat.scope[0]
+    assert classify_scope(FakeChat("ALLOW PRICE"), "q") == "ALLOW PRICE"
+    assert classify_scope(FakeChat("allow other"), "q") == "ALLOW OTHER"
+    assert classify_scope(FakeChat("allow price"), "q") == "ALLOW PRICE"
 
 
 def test_scope_leveler_use_case_sends_catalog_hint() -> None:
-    chat = FakeChat("ALLOW")
+    chat = FakeChat("ALLOW OTHER")
     query = "What is the best leveler for a blast freezer?"
-    assert classify_scope(chat, query) == "ALLOW"
-    assert chat.calls[0][1] == catalog_hint(query)
-    assert "leveler → dock leveler" in chat.calls[0][1]
+    assert classify_scope(chat, query) == "ALLOW OTHER"
+    assert chat.scope[0] == catalog_hint(query)
+    assert "leveler → dock leveler" in chat.scope[0]
 
 
 def test_scope_deny_extra_prose_and_punctuation() -> None:
-    assert classify_scope(FakeChat("ALLOW extra"), "q") == "DENY"
-    assert classify_scope(FakeChat("ALLOW."), "q") == "DENY"
+    assert classify_scope(FakeChat("ALLOW OTHER extra"), "q") == "DENY"
+    assert classify_scope(FakeChat("ALLOW OTHER."), "q") == "DENY"
+    assert classify_scope(FakeChat("ALLOW PRICE."), "q") == "DENY"
+    assert classify_scope(FakeChat("ALLOW"), "q") == "DENY"
     assert classify_scope(FakeChat("DENY"), "q") == "DENY"
     assert classify_scope(FakeChat(""), "q") == "DENY"
 
@@ -183,18 +231,22 @@ def test_scope_subjective_exact_token() -> None:
 
 def test_pinecone_filter_roles() -> None:
     assert pinecone_filter("sales") == {"doc_type": {"$ne": "service"}}
-    assert pinecone_filter("technician") == {
-        "$and": [
-            {"doc_type": {"$ne": "pricing"}},
-            {"contains_pricing": {"$eq": False}},
-        ]
+    assert pinecone_filter("technician") == {"doc_type": {"$ne": "pricing"}}
+
+
+def test_scope_instructions_allow_broad_product_asks() -> None:
+    assert "Do not require a model number" in SCOPE_INSTRUCTIONS
+    assert "every product we document" in SCOPE_INSTRUCTIONS
+    assert "catalog" in SCOPE_INSTRUCTIONS
+    assert {choice["value"] for choice in SCOPE_CHOICES} == {
+        "ALLOW OTHER",
+        "ALLOW PRICE",
+        "SUBJECTIVE",
+        "DENY",
     }
-
-
-def test_scope_sys_allows_broad_meridian_product_asks() -> None:
-    assert "broad but still about our catalog" in SCOPE_SYS
-    assert "every / all / each Meridian product" in SCOPE_SYS
-    assert "Do not require a model number" in SCOPE_SYS
+    assert "ALLOW PRICE when the user is asking about pricing" in SCOPE_INSTRUCTIONS
+    assert "does not ask about pricing" in SCOPE_INSTRUCTIONS
+    assert "These words refer to our products" in SCOPE_INSTRUCTIONS
 
 
 def test_decide_and_generate_treat_conflict_as_answer() -> None:
@@ -209,17 +261,29 @@ def test_decide_and_generate_treat_conflict_as_answer() -> None:
     assert "disagree on the same fact" in REFUSE_SYS
 
 
-def test_receipt_ok() -> None:
-    hits = [make_hit(id="a"), make_hit(id="b")]
-    assert receipt_ok(["a"], hits)
-    assert receipt_ok(["b", "a"], hits)
-    assert not receipt_ok([], hits)
-    assert not receipt_ok(["a", "nope"], hits)
-    assert not receipt_ok(["made-up"], hits)
+def test_answer_supported_sends_the_answer_and_cited_chunks() -> None:
+    cited = make_hit(id="spec_md7000::1", text="Capacity is 35,000 lbs.")
+    other = make_hit(id="faq::1", text="The lip is 16 in.")
+    chat = FakeChat("DENY")
+    assert answer_supported(chat, "35,000 lbs.", [cited.id, "invented"], [cited, other])
+    sent = chat.support[0]
+    assert "Answer:\n35,000 lbs." in sent
+    assert "Capacity is 35,000 lbs." in sent
+    assert cited.id in sent
+    assert "The lip is 16 in." not in sent
+    assert "invented" not in sent
+    assert "every factual claim" in chat.support_instructions[0]
+    assert answer_supported(FakeChat("DENY", "supported"), "35,000 lbs.", [cited.id], [cited])
+    assert not answer_supported(FakeChat("DENY", "Unsupported"), "40,000 lbs.", [cited.id], [cited])
+    assert not answer_supported(FakeChat("DENY", "Supported."), "35,000 lbs.", [cited.id], [cited])
+    assert not answer_supported(FakeChat("DENY", "Supported extra"), "35,000 lbs.", [cited.id], [cited])
+    assert not answer_supported(FakeChat("DENY", ""), "35,000 lbs.", [], [cited])
+    with pytest.raises(RuntimeError, match="boom"):
+        answer_supported(FakeChat("DENY", RuntimeError("boom")), "35,000 lbs.", [cited.id], [cited])
 
 
 def test_run_ask_trivial_prints_banner_no_llm(tmp_path, capsys) -> None:
-    chat = FakeChat("ALLOW")
+    chat = FakeChat("ALLOW OTHER")
     code = run_ask(make_config(tmp_path), "sales", "  ", chat=chat)
     out = capsys.readouterr().out
     assert code == 0
@@ -236,9 +300,10 @@ def test_run_ask_redirect_on_deny(tmp_path, capsys) -> None:
     assert BANNER in out
     assert REDIRECT in out
     assert "--- stats ---" not in out
-    assert chat.calls[0][0] == SCOPE_SYS
-    assert chat.calls[0][1] == "Write me a poem"
-    assert "sales" not in chat.calls[0][0].lower()
+    assert chat.calls == []
+    assert chat.scope == ["Write me a poem"]
+    assert "sales" not in chat.scope_instructions[0].lower()
+    assert "technician" not in chat.scope_instructions[0].lower()
 
 
 def test_run_ask_missing_index_explains_ingest(tmp_path, capsys, monkeypatch) -> None:
@@ -251,7 +316,7 @@ def test_run_ask_missing_index_explains_ingest(tmp_path, capsys, monkeypatch) ->
         make_config(tmp_path),
         "sales",
         "MD-7000 capacity?",
-        chat=FakeChat("ALLOW"),
+        chat=FakeChat("ALLOW OTHER"),
         embeddings=FakeEmbeddings(),
     )
     captured = capsys.readouterr()
@@ -273,21 +338,16 @@ def test_run_ask_reports_a_failed_gate_as_an_error_not_a_redirect(tmp_path, caps
 
 
 def test_run_ask_stats_prices_reported_tokens(tmp_path, capsys) -> None:
-    usage = SimpleNamespace(
-        prompt_tokens=1000,
-        completion_tokens=10,
-        prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-    )
-
-    class Completions:
+    class Decisions:
         def create(self, **kwargs):
-            del kwargs
+            assert kwargs["model"] == "gpt-6-luna"
+            assert kwargs["questions"][0]["type"] == "choice"
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="DENY"))],
-                usage=usage,
+                answers=[SimpleNamespace(type="choice", choice="DENY")],
+                usage=SimpleNamespace(input_tokens=1000),
             )
 
-    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    client = SimpleNamespace(decisions=Decisions())
     chat = OpenAIChat(client, "gpt-5.4-nano")
     code = run_ask(
         make_config(tmp_path),
@@ -301,9 +361,10 @@ def test_run_ask_stats_prices_reported_tokens(tmp_path, capsys) -> None:
     assert REDIRECT in out
     assert out.index(REDIRECT) < out.index("--- stats ---")
     assert "workflow: ask" in out
-    assert "chat_calls: 1 model=gpt-5.4-nano prompt_tokens=1000 completion_tokens=10" in out
-    # 1000 * $0.20 / 1M + 10 * $1.25 / 1M
-    assert "token_cost_usd: 0.00021250" in out
+    assert "chat_calls: 0 model=- prompt_tokens=0 completion_tokens=0" in out
+    assert "decision_calls: 1 model=gpt-6-luna prompt_tokens=1000" in out
+    # 1000 * $0.10 / 1M, input only
+    assert "token_cost_usd: 0.00010000" in out
     assert "pinecone_calls: 0" in out
     assert "latency_ms:" in out
 
@@ -333,14 +394,15 @@ def test_run_ask_subjective_stops_before_retrieve(tmp_path, capsys) -> None:
     assert REFUSE not in out
     assert "Related:" not in out
     assert called["retrieve"] is False
-    assert chat.calls == [(SCOPE_SYS, catalog_hint(query), False)]
-    assert "dock leveler → dock leveler" in chat.calls[0][1]
-    assert "sales" not in chat.calls[0][0].lower()
-    assert "technician" not in chat.calls[0][0].lower()
+    assert chat.calls == []
+    assert chat.scope == [catalog_hint(query)]
+    assert "dock leveler → dock leveler" in chat.scope[0]
+    assert "sales" not in chat.scope_instructions[0].lower()
+    assert "technician" not in chat.scope_instructions[0].lower()
 
 
 def test_run_ask_empty_usable_refuses_without_links(tmp_path, capsys) -> None:
-    chat = FakeChat("ALLOW")
+    chat = FakeChat("ALLOW OTHER")
     code = run_ask(
         make_config(tmp_path),
         "sales",
@@ -354,8 +416,9 @@ def test_run_ask_empty_usable_refuses_without_links(tmp_path, capsys) -> None:
     assert REFUSE in captured.out
     assert "Related:" not in captured.out
     assert captured.err == ""
-    assert chat.calls == [(SCOPE_SYS, catalog_hint("MD-9000 capacity?"), False)]
-    assert "md-9000 → dock leveler" in chat.calls[0][1]
+    assert chat.calls == []
+    assert chat.scope == [catalog_hint("MD-9000 capacity?")]
+    assert "md-9000 → dock leveler" in chat.scope[0]
 
 
 def test_run_ask_below_floor_refuses_without_links(tmp_path, capsys) -> None:
@@ -364,7 +427,7 @@ def test_run_ask_below_floor_refuses_without_links(tmp_path, capsys) -> None:
         make_config(tmp_path),
         "sales",
         "MD-7000 capacity?",
-        chat=FakeChat("ALLOW"),
+        chat=FakeChat("ALLOW OTHER"),
         retriever=lambda query, role: [hit],
     )
     out = capsys.readouterr().out
@@ -373,39 +436,65 @@ def test_run_ask_below_floor_refuses_without_links(tmp_path, capsys) -> None:
     assert "Related:" not in out
 
 
-def test_run_ask_technician_price_ask_is_denied_before_retrieval(tmp_path, capsys) -> None:
+def test_run_ask_technician_allow_price_is_denied_before_retrieval(tmp_path, capsys) -> None:
     called = {"retrieve": False}
 
     def retriever(query, role):
         called["retrieve"] = True
         return [make_hit()]
 
-    chat = FakeChat("ALLOW")
+    chat = FakeChat("ALLOW PRICE")
     for query in (
         "What is the list price for a 7 ft by 10 ft MD-7000 with 460V?",
-        "What does the MD-9000 cost?",
-        "Can you quote me a ThermaGuard 600?",
-        "MD-7000 pricing",
+        "How much for an MD-9000?",
     ):
         code = run_ask(make_config(tmp_path), "technician", query, chat=chat, retriever=retriever)
         out = capsys.readouterr().out
         assert code == 0
         assert PRICING_DENIED in out
         assert REFUSE not in out
+        assert REDIRECT not in out
     assert called["retrieve"] is False
-    # Scope still runs first: a poem about prices is a redirect, not a price denial.
-    assert all(call[0] == SCOPE_SYS for call in chat.calls)
+    assert len(chat.scope) == 2
+    assert chat.calls == []
+
+    # The words in the question do not decide this. ALLOW OTHER proceeds.
+    other = FakeChat("ALLOW OTHER")
+    code = run_ask(
+        make_config(tmp_path),
+        "technician",
+        "MD-7000 pricing",
+        chat=other,
+        retriever=retriever,
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert PRICING_DENIED not in out
+    assert called["retrieve"] is True
+
+    # Out of scope is still a redirect, including a poem that mentions a price.
+    denied = FakeChat("DENY")
+    code = run_ask(
+        make_config(tmp_path),
+        "technician",
+        "Write a poem about the MD-7000 price",
+        chat=denied,
+        retriever=retriever,
+    )
+    out = capsys.readouterr().out
+    assert REDIRECT in out
+    assert PRICING_DENIED not in out
 
 
-def test_run_ask_technician_price_belt_still_drops_untagged_price_hits(tmp_path, capsys) -> None:
-    # A question with no price word can still pull a priced chunk. The belt
-    # after retrieval is the second cut.
-    priced = make_hit(id="price::0", text="Stainless lip option: $1,200", score=0.99)
+def test_run_ask_technician_price_belt_drops_pricing_documents(tmp_path, capsys) -> None:
+    # A question with no price word can still pull a pricing document. The belt
+    # after retrieval uses the document type.
+    priced = make_hit(id="price::0", doc_type="pricing", text="Stainless lip option: $1,200", score=0.99)
     code = run_ask(
         make_config(tmp_path),
         "technician",
         "Which lip option is recommended for wash-down zones?",
-        chat=FakeChat("ALLOW"),
+        chat=FakeChat("ALLOW OTHER"),
         retriever=lambda query, role: [priced],
     )
     out = capsys.readouterr().out
@@ -418,10 +507,10 @@ def test_run_ask_sales_price_ask_is_not_denied(tmp_path, capsys) -> None:
     hit = make_hit(id="pricing::0", doc_type="pricing", text="7 ft × 10 ft, 230V: $10,200. 460V: +$350.")
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("$10,550.", hit.id),
-        }
+        },
+        scope_label="ALLOW PRICE",
     )
     code = run_ask(
         make_config(tmp_path),
@@ -466,36 +555,12 @@ def test_outdated_note_rules() -> None:
     assert outdated_note("   ", [legacy]) == canned
 
 
-def test_strip_outdated_claims() -> None:
-    answer = (
-        "The MD-5000 is not rated for blast freezers. Specify the MD-9000.\n\n"
-        "Note: An outdated document lists a conflicting temperature rating for the MD-5000."
-    )
-    assert strip_outdated_claims(answer) == (
-        "The MD-5000 is not rated for blast freezers. Specify the MD-9000."
-    )
-    assert strip_outdated_claims("Capacity is 35,000 lbs.") == "Capacity is 35,000 lbs."
-
-
-def test_strip_follow_ups_drops_the_offer_to_continue() -> None:
-    answer = (
-        "Specify the MD-9000 with a ThermaGuard 600.\n\n"
-        "If you want, tell me your dock pit and electrical/air constraints and "
-        "I can map these to the installation requirements."
-    )
-    assert strip_follow_ups(answer) == "Specify the MD-9000 with a ThermaGuard 600."
-    assert strip_follow_ups("The MD-9000 needs 80–100 psi compressed air.") == (
-        "The MD-9000 needs 80–100 psi compressed air."
-    )
-
-
 def test_run_ask_superseded_revision_always_gets_a_note_and_source(tmp_path, capsys) -> None:
     current = make_hit()
     legacy = make_hit(**LEGACY)
     # The model cites only the current doc and gives no note. Python adds both.
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("35,000 lbs.", current.id),
         }
@@ -531,7 +596,6 @@ def test_naming_the_hydraulic_alternative_does_not_note_a_conflict(tmp_path, cap
     )
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json(
                 "Specify the MD-9000. Hydraulic fluid viscosity increases significantly "
@@ -559,7 +623,6 @@ def test_run_ask_superseded_note_from_model_when_grounded(tmp_path, capsys) -> N
     legacy = make_hit(**LEGACY)
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json(
                 "35,000 lbs.",
@@ -582,39 +645,6 @@ def test_run_ask_superseded_note_from_model_when_grounded(tmp_path, capsys) -> N
     assert "Note: a superseded revision" not in out
     # Cited once, not duplicated by the superseded append.
     assert out.count(legacy.id) == 1
-
-
-def test_run_ask_invented_outdated_claim_is_stripped(tmp_path, capsys) -> None:
-    hit = make_hit(
-        id="faq_selection_guide::q4",
-        title="FAQ: Which Dock Leveler Should I Choose?",
-        doc_id="faq_selection_guide",
-        doc_type="faq",
-        model="multi",
-        text="The MD-5000 has an operating temperature floor of -20°F.",
-    )
-    chat = ScriptedChat(
-        {
-            SCOPE_SYS: "ALLOW",
-            DECIDE_SYS: "ANSWER",
-            GEN_SYS: gen_json(
-                "No. Specify the MD-9000.\n\nNote: An outdated document lists a conflicting rating.",
-                hit.id,
-                outdated_note="An outdated document lists a conflicting temperature rating.",
-            ),
-        }
-    )
-    code = run_ask(
-        make_config(tmp_path),
-        "sales",
-        "Can I install a mechanical dock leveler in a blast freezer?",
-        chat=chat,
-        retriever=lambda query, role: [hit],
-    )
-    out = capsys.readouterr().out
-    assert code == 0
-    assert "No. Specify the MD-9000." in out
-    assert "outdated" not in out.lower()
 
 
 def test_format_refuse_templates() -> None:
@@ -650,7 +680,6 @@ def test_run_ask_decide_refuse_prints_missing_info(tmp_path, capsys) -> None:
     hit = make_hit()
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "REFUSE",
             REFUSE_SYS: refuse_json("MISSING_INFO", "a CE mark number"),
         }
@@ -669,7 +698,7 @@ def test_run_ask_decide_refuse_prints_missing_info(tmp_path, capsys) -> None:
     assert "- MD-7000 Specification (docs/spec_md7000.md)" in out
     assert "Sources:" not in out
     # The draft was started alongside decide and discarded on REFUSE.
-    assert_decided_and_drafted_together(chat, before=SCOPE_SYS, after=REFUSE_SYS)
+    assert_decided_and_drafted_together(chat, after=REFUSE_SYS)
     refuse_call = only_call(chat, REFUSE_SYS)
     assert refuse_call[2] is True
     payload = json.loads(refuse_call[1])
@@ -707,7 +736,6 @@ def test_run_ask_ambiguous_capacity_without_model(tmp_path, capsys) -> None:
     ]
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "REFUSE",
             REFUSE_SYS: refuse_json("AMBIGUOUS", "which dock leveler model"),
         }
@@ -757,7 +785,6 @@ def test_run_ask_ambiguous_md7000_price_without_config(tmp_path, capsys) -> None
     )
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "REFUSE",
             REFUSE_SYS: refuse_json(
                 "AMBIGUOUS", "which MD-7000 platform size and voltage"
@@ -786,7 +813,6 @@ def test_run_ask_decide_refuse_unknown_keeps_canned_line(tmp_path, capsys) -> No
     hit = make_hit()
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "REFUSE",
             REFUSE_SYS: refuse_json("UNKNOWN", ""),
         }
@@ -811,7 +837,6 @@ def test_run_ask_decide_refuse_unknown_prints_related_topic(tmp_path, capsys) ->
     hit = make_hit()
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "REFUSE",
             REFUSE_SYS: refuse_json("UNKNOWN", "European market certifications"),
         }
@@ -829,14 +854,14 @@ def test_run_ask_decide_refuse_unknown_prints_related_topic(tmp_path, capsys) ->
     assert "Related:" in out
 
 
-def test_run_ask_bad_citation_hides_answer(tmp_path, capsys) -> None:
+def test_run_ask_unsupported_hides_answer(tmp_path, capsys) -> None:
     hit = make_hit()
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
-            GEN_SYS: gen_json("should not print", "invented-id"),
-        }
+            GEN_SYS: gen_json("should not print", hit.id),
+        },
+        support_label="Unsupported",
     )
     code = run_ask(
         make_config(tmp_path),
@@ -850,6 +875,31 @@ def test_run_ask_bad_citation_hides_answer(tmp_path, capsys) -> None:
     assert "should not print" not in out
     assert REFUSE in out
     assert "Related:" in out
+    assert "should not print" in chat.support[0]
+    assert hit.text in chat.support[0]
+
+
+def test_run_ask_support_failure_is_an_error_not_a_refuse(tmp_path, capsys) -> None:
+    hit = make_hit()
+    chat = ScriptedChat(
+        {
+            DECIDE_SYS: "ANSWER",
+            GEN_SYS: gen_json("should not print", hit.id),
+        },
+        support_label=RuntimeError("Connection error."),
+    )
+    code = run_ask(
+        make_config(tmp_path),
+        "sales",
+        "MD-7000 capacity?",
+        chat=chat,
+        retriever=lambda query, role: [hit],
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "should not print" not in captured.out
+    assert REFUSE not in captured.out
+    assert "error: Connection error." in captured.err
 
 
 def test_run_ask_happy_path_prints_answer_staple_sources(
@@ -861,7 +911,6 @@ def test_run_ask_happy_path_prints_answer_staple_sources(
     hit = make_hit(text=f"Reset at 1,800 psi.\n\n## Safety limits\n\n{excerpt}\n")
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("35,000 lbs.", hit.id),
         }
@@ -881,13 +930,16 @@ def test_run_ask_happy_path_prints_answer_staple_sources(
     assert excerpt in out
     assert f"- MD-7000 Specification (docs/spec_md7000.md, {hit.id})" in out
     assert "Outdated revision" not in out
-    assert_decided_and_drafted_together(chat, before=SCOPE_SYS, after=None)
+    assert_decided_and_drafted_together(chat, after=None)
     gen_call = only_call(chat, GEN_SYS)
     assert gen_call[2] is True
     gen_payload = json.loads(gen_call[1])
     assert gen_payload["query"] == "MD-7000 capacity?"
     assert "role" not in gen_payload
     assert gen_payload["chunks"][0]["flagged_outdated"] is False
+    assert chat.support
+    assert "35,000 lbs." in chat.support[0]
+    assert hit.text in chat.support[0]
 
 
 def test_run_ask_stale_cache_falls_back_to_the_chunk_text(tmp_path, capsys) -> None:
@@ -901,7 +953,6 @@ def test_run_ask_stale_cache_falls_back_to_the_chunk_text(tmp_path, capsys) -> N
     )
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("1,800 psi.", hit.id),
         }
@@ -932,7 +983,6 @@ def test_run_ask_staples_from_the_ingest_cache_without_a_warn_call(
     )
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("35,000 lbs.", hit.id),
         }
@@ -948,7 +998,7 @@ def test_run_ask_staples_from_the_ingest_cache_without_a_warn_call(
     assert code == 0
     assert "35,000 lbs." in out
     assert excerpt in out
-    assert_decided_and_drafted_together(chat, before=SCOPE_SYS, after=None)
+    assert_decided_and_drafted_together(chat, after=None)
 
 
 def test_run_ask_refuse_discards_a_finished_draft(tmp_path, capsys) -> None:
@@ -957,7 +1007,6 @@ def test_run_ask_refuse_discards_a_finished_draft(tmp_path, capsys) -> None:
     hit = make_hit()
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "REFUSE",
             GEN_SYS: gen_json("35,000 lbs. Trust me.", hit.id),
             REFUSE_SYS: refuse_json("MISSING_INFO", "the asked value"),
@@ -975,7 +1024,7 @@ def test_run_ask_refuse_discards_a_finished_draft(tmp_path, capsys) -> None:
     assert "Trust me" not in out
     assert "Sources:" not in out
     assert f"{REFUSE} Missing information: the asked value" in out
-    assert_decided_and_drafted_together(chat, before=SCOPE_SYS, after=REFUSE_SYS)
+    assert_decided_and_drafted_together(chat, after=REFUSE_SYS)
 
 
 def test_run_ask_refuse_ignores_a_draft_that_errored(tmp_path, capsys) -> None:
@@ -983,7 +1032,6 @@ def test_run_ask_refuse_ignores_a_draft_that_errored(tmp_path, capsys) -> None:
     hit = make_hit()
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "REFUSE",
             GEN_SYS: RuntimeError("draft connection dropped"),
             REFUSE_SYS: refuse_json("UNKNOWN", ""),
@@ -1007,7 +1055,6 @@ def test_run_ask_answer_surfaces_a_draft_that_errored(tmp_path, capsys) -> None:
     hit = make_hit()
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: RuntimeError("draft connection dropped"),
         }
@@ -1029,7 +1076,6 @@ def test_run_ask_clean_warnings_skip_staple(tmp_path, capsys) -> None:
     hit = make_hit()
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("35,000 lbs.", hit.id),
         }
@@ -1057,7 +1103,6 @@ def test_run_ask_hides_sales_note_from_technician(tmp_path, capsys) -> None:
     )
     chat = ScriptedChat(
         {
-            SCOPE_SYS: "ALLOW",
             DECIDE_SYS: "ANSWER",
             GEN_SYS: gen_json("No CE mark as stock.", hit.id),
         }
@@ -1080,7 +1125,8 @@ def test_retrieve_uses_role_filter_and_price_belt(tmp_path, monkeypatch) -> None
     captured: dict = {}
     hits = [
         make_hit(id="ok::0", text="Capacity is 40,000 lbs."),
-        make_hit(id="priced::0", text="List price $10,550"),
+        make_hit(id="dollar::0", text="Stainless lip option: $1,200"),
+        make_hit(id="priced::0", text="List price $10,550", doc_type="pricing"),
     ]
 
     def fake_query(cfg, vector, filter, top_k):
@@ -1096,19 +1142,8 @@ def test_retrieve_uses_role_filter_and_price_belt(tmp_path, monkeypatch) -> None
     assert embeddings.texts == ["capacity?"]
     assert captured["vector"] == [0.3, 0.4]
     assert captured["filter"] == pinecone_filter("technician")
-    assert captured["top_k"] == cfg.retrieve_pool
-    assert [hit.id for hit in out] == ["ok::0"]
-
-
-def test_cap_per_doc_keeps_order_and_limit() -> None:
-    hits = [
-        make_hit(id="faq::q0", doc_id="faq"),
-        make_hit(id="faq::q1", doc_id="faq"),
-        make_hit(id="faq::q2", doc_id="faq"),
-        make_hit(id="spec::0", doc_id="spec"),
-    ]
-    assert [hit.id for hit in cap_per_doc(hits, 2)] == ["faq::q0", "faq::q1", "spec::0"]
-    assert [hit.id for hit in cap_per_doc(hits, 0)] == [hit.id for hit in hits]
+    assert captured["top_k"] == cfg.top_k
+    assert [hit.id for hit in out] == ["ok::0", "dollar::0"]
 
 
 def test_complete_citations_adds_retrieved_docs_that_name_the_same_model() -> None:
@@ -1316,7 +1351,9 @@ def test_related_sub_chunks_skips_an_unchunked_file(tmp_path, monkeypatch) -> No
     assert out == [hit]
 
 
-def test_related_sub_chunks_hides_priced_relative_from_technician(tmp_path, monkeypatch) -> None:
+def test_related_sub_chunks_keeps_a_dollar_amount_and_drops_a_pricing_document(
+    tmp_path, monkeypatch
+) -> None:
     recommendation = make_hit(
         id="faq_cold_storage::q0",
         doc_id="faq_cold_storage",
@@ -1324,15 +1361,24 @@ def test_related_sub_chunks_hides_priced_relative_from_technician(tmp_path, monk
         text="Specify the MD-9000 dock leveler.",
         score=0.7,
     )
-    priced = make_hit(
+    dollar = make_hit(
         id="faq_cold_storage::q1",
         doc_id="faq_cold_storage",
         doc_type="faq",
         text="The MD-9000 stainless lip is +$1,200.",
     )
-    monkeypatch.setattr("mka.ask.store.query", lambda cfg, vector, filter, top_k: [priced])
+    sheet = make_hit(
+        id="pricing_md7000_2026::1",
+        doc_id="pricing_md7000_2026",
+        doc_type="pricing",
+        text="The MD-9000 list is $12,000.",
+    )
+    monkeypatch.setattr(
+        "mka.ask.store.query",
+        lambda cfg, vector, filter, top_k: [dollar, sheet],
+    )
     out = related_sub_chunks(make_config(tmp_path), "technician", [0.1], [recommendation])
-    assert [hit.id for hit in out] == [recommendation.id]
+    assert [hit.id for hit in out] == [recommendation.id, dollar.id]
 
 
 def test_related_sub_chunks_pulls_service_chunks_in_the_same_family(tmp_path, monkeypatch) -> None:
@@ -1396,6 +1442,23 @@ def test_include_documented_cause_adds_the_omitted_mechanism() -> None:
     assert ids == [why.id]
 
 
+def test_include_documented_cause_finds_a_why_heading_under_the_title() -> None:
+    why = make_hit(
+        id="faq_cold_storage::2",
+        doc_id="faq_cold_storage",
+        doc_type="faq",
+        text="# FAQ: Cold Storage\n\n**Revision:** 2025-01\n\n" + WHY,
+    )
+    draft = "Specify the MD-9000. It operates down to -40°F."
+    answer, ids = include_documented_cause(
+        "What equipment should I specify and why?",
+        draft,
+        [why],
+    )
+    assert "viscosity" in answer
+    assert ids == [why.id]
+
+
 def test_include_documented_cause_leaves_a_complete_answer() -> None:
     why = make_hit(id="faq_cold_storage::q1", doc_id="faq_cold_storage", doc_type="faq", text=WHY)
     draft = (
@@ -1438,6 +1501,6 @@ def test_retrieve_follow_up_pulls_missing_model_spec(tmp_path, monkeypatch) -> N
     monkeypatch.setattr("mka.ask.store.query", fake_query)
     out = retrieve(make_config(tmp_path), FakeEmbeddings(), "freezer dock?", "sales")
     assert [hit.id for hit in out] == [faq.id, spec.id]
-    assert calls[0] == make_config(tmp_path).retrieve_pool
+    assert calls[0] == make_config(tmp_path).top_k
     assert calls[1] == 4
 

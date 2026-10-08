@@ -10,11 +10,13 @@ from typing import Any, Callable, Iterator
 # USD per 1M tokens, standard list price. A model not listed reports "unknown".
 _CHAT_RATES: dict[str, tuple[float, float]] = {"gpt-5.4-nano": (0.20, 1.25)}  # (in, out)
 _EMBED_RATES: dict[str, float] = {"text-embedding-3-small": 0.02}
+# Decisions bills input tokens only.
+_DECISION_RATES: dict[str, float] = {"gpt-6-luna": 0.10}
 
 
 @dataclass
 class Call:
-    kind: str  # "chat" | "embed"
+    kind: str  # "chat" | "embed" | "decision"
     model: str
     prompt_tokens: int | None
     completion_tokens: int | None
@@ -92,6 +94,16 @@ def record_chat(model: str, response: object, latency_ms: float) -> None:
     )
 
 
+def record_decision(model: str, response: object, latency_ms: float) -> None:
+    if _current is None:
+        return
+    usage_obj = lookup(response, "usage")
+    tokens = _int(lookup(usage_obj, "input_tokens", "prompt_tokens", "total_tokens"))
+    _current.calls.append(
+        Call("decision", model, tokens, 0 if tokens is not None else None, latency_ms)
+    )
+
+
 def record_embed(model: str, response: object, latency_ms: float) -> None:
     if _current is None:
         return
@@ -117,6 +129,11 @@ def token_cost_usd(calls: list[Call]) -> float | None:
             if rate is None:
                 return None
             total += call.prompt_tokens * rate[0] + call.completion_tokens * rate[1]
+        elif call.kind == "decision":
+            rate_d = _DECISION_RATES.get(_base_model(call.model, _DECISION_RATES))
+            if rate_d is None:
+                return None
+            total += call.prompt_tokens * rate_d
         else:
             rate_e = _EMBED_RATES.get(_base_model(call.model, _EMBED_RATES))
             if rate_e is None:
@@ -131,7 +148,7 @@ def render(ledger: Ledger) -> str:
         f"workflow: {ledger.workflow}",
         f"latency_ms: {elapsed_ms(ledger.started):.0f}",
     ]
-    for kind in ("chat", "embed"):
+    for kind in ("chat", "embed", "decision"):
         group = [call for call in ledger.calls if call.kind == kind]
         models = ",".join(dict.fromkeys(call.model for call in group)) or "-"
         prompt = _sum(call.prompt_tokens for call in group)

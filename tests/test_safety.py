@@ -172,11 +172,11 @@ def test_extract_over_the_real_corpus_matches_the_marked_hazards() -> None:
 
 def test_assign_puts_a_note_inside_one_chunk_on_that_chunk_only() -> None:
     chunks = chunk_document(_row(), SERVICE_DOC)
-    assert len(chunks) == 2
+    assert len(chunks) == 4
     local = WarningExcerpt("> ⚠ **CAUTION**\n> Pump housing is hot.", "all")
     # Put the note inside the second symptom's body only.
     chunks[1] = replace(chunks[1], text=chunks[1].text.replace("Check fluid level.", local.text))
-    assert assign_warnings([local], chunks) == 2
+    assert assign_warnings([local], chunks) == 4
     assert chunks[0].metadata["warning_excerpts"] == []
     assert chunks[1].metadata["warning_excerpts"] == [local.text]
 
@@ -184,21 +184,27 @@ def test_assign_puts_a_note_inside_one_chunk_on_that_chunk_only() -> None:
 def test_assign_puts_a_note_in_no_chunk_on_every_chunk() -> None:
     chunks = chunk_document(_row(), SERVICE_DOC)
     dropped = WarningExcerpt("Only in the header, which the splitter removed.", "sales")
-    assert assign_warnings([dropped], chunks) == 2
+    assert assign_warnings([dropped], chunks) == 4
     for chunk in chunks:
         assert chunk.metadata["warning_excerpts"] == [dropped.text]
         assert chunk.metadata["warning_audiences"] == ["sales"]
         assert chunk.metadata["warnings_cached"] is True
 
 
-def test_assign_real_service_doc_puts_shared_notes_on_every_piece() -> None:
+def test_assign_real_service_doc_scopes_notes_to_the_section_that_holds_them() -> None:
     chunks = chunk_document(_row(), SERVICE_DOC)
     assign_warnings(extract_warnings(SERVICE_DOC), chunks)
+    # Front matter is copied onto every section, so those notes ride along.
     for chunk in chunks:
         texts = chunk.metadata["warning_excerpts"]
         assert any(text.startswith("> ⚠ **DANGER") for text in texts)
-        assert any("**Never** exceed 2,100 psi" in text for text in texts)
         assert any(text.startswith("**Classification:**") for text in texts)
+    safety = next(chunk for chunk in chunks if "## Safety limits" in chunk.text)
+    assert any("**Never** exceed 2,100 psi" in text for text in safety.metadata["warning_excerpts"])
+    for chunk in chunks:
+        if chunk is safety:
+            continue
+        assert not any("2,100 psi" in text for text in chunk.metadata["warning_excerpts"])
 
 
 def test_attach_warnings_copies_rows_onto_a_chunk() -> None:

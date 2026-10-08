@@ -30,8 +30,15 @@ def test_render_with_no_calls() -> None:
     assert "latency_ms:" in text
     assert "chat_calls: 0" in text
     assert "embed_calls: 0" in text
+    assert "decision_calls: 0" in text
     assert "token_cost_usd: 0.00000000" in text
     assert "pinecone_calls: 0" in text
+
+
+def test_decision_cost_is_input_tokens_only() -> None:
+    # 1000 * $0.10 / 1M. No output charge.
+    call = Call("decision", "gpt-6-luna", 1000, 0, latency_ms=1)
+    assert token_cost_usd([call]) == 0.0001
 
 
 def test_render_lists_pinecone_calls_with_detail() -> None:
