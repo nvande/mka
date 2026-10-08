@@ -19,11 +19,10 @@ def make_config(corpus_dir: Path, pinecone_api_key: str = "") -> Config:
         pinecone_namespace="poc",
         llm_provider="openai",
         chat_model="gpt-5.4-nano",
+        decision_model="gpt-6-luna",
         embed_model="text-embedding-3-small",
         embed_dim=1536,
         top_k=8,
-        retrieve_pool=16,
-        max_chunks_per_doc=2,
         retrieve_floor=0.20,
         max_query_chars=4000,
     )

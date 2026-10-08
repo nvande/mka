@@ -177,18 +177,18 @@ def test_run_ingest_scopes_warning_cache_by_where_the_note_lives(
 
     assert run_ingest(make_config(corpus)) == 0
     by_id = {chunk.id: chunk.metadata for chunk in written[0]}
-    assert sorted(by_id) == ["faq_cold::q0", "faq_cold::q1", "faq_cold::q2"]
+    assert sorted(by_id) == ["faq_cold::1", "faq_cold::2", "faq_cold::3"]
     header = "**Audience:** Sales team only — do not share with end customers without approval"
     block = "> ⚠ **WARNING**\n> Running without the seal ices the track."
-    # The header note was dropped from every Q chunk, so it reaches all three.
+    # Front matter is copied onto every section, so the header note reaches all three.
     for meta in by_id.values():
         assert meta["warnings_cached"] is True
         assert header in meta["warning_excerpts"]
     # The blockquote sits inside one answer and reaches only that chunk.
-    assert block in by_id["faq_cold::q1"]["warning_excerpts"]
-    assert block not in by_id["faq_cold::q0"]["warning_excerpts"]
-    assert block not in by_id["faq_cold::q2"]["warning_excerpts"]
-    assert by_id["faq_cold::q1"]["warning_audiences"] == ["sales", "all"]
+    assert block in by_id["faq_cold::2"]["warning_excerpts"]
+    assert block not in by_id["faq_cold::1"]["warning_excerpts"]
+    assert block not in by_id["faq_cold::3"]["warning_excerpts"]
+    assert by_id["faq_cold::2"]["warning_audiences"] == ["sales", "all"]
     assert "warnings: cached on 3/3 chunks" in capsys.readouterr().out
 
 

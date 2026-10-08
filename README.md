@@ -12,12 +12,13 @@ This application is for demonstration purposes only and is not intended for depl
 
 The main goal of this project was to avoid wrong answers at all costs. To accomplish this, the following decisions were made:
 
-- GPT-5.4-nano is used specifically for its low (~3%) hallucination rate and low latency ([https://github.com/vectara/hallucination-leaderboard/](https://github.com/vectara/hallucination-leaderboard/)).
+- GPT-5.4-nano answers questions, chosen for its low (~3%) hallucination rate and low latency ([https://github.com/vectara/hallucination-leaderboard/](https://github.com/vectara/hallucination-leaderboard/)). Whether a question is in scope, and whether an in-scope question needs pricing, is a fixed choice, so that step uses the Decisions API (`gpt-6-luna`) instead of a chat completion. A technician who is asking for a price stops before retrieval.
 - The vector store is Pinecone DB, chosen for low latency retrieval (~30ms in ideal conditions) and ease to set up.
 - For chunking:
-  - `mka` stores *some* documents in full -- this is an intentional choice which maintains maximal context proximity present in the original document and reduces the risk of important context loss from improper chunking of spec sheets. GPT-5.4-nano's context window is large, and because of the lack of chat log or ReAct reasoning history to maintain, an overloaded context is not a concern for this MVP. This decision is also based on small file size in the example corpus.
-  - Only FAQs, Service Procedures, and Diagnostic Procedures are split by question or procedure; they represent a clear repeated structure that can be optimized with relevance sorting with no risk of context loss.
-- Every answer goes through an in-context gate, an initial generation, and a receipt pass that drops the answer if any citation id was missing or invented. This process is optimized with parallel execution of LLM calls.
+  - Documents are split on the markdown outline (`##`, `###`, and so on). A file with only one section stays one chunk.
+  - Each chunk copies in the document title, the front matter under that title, and the ancestor headings. A section retrieved on its own still names the document and the parent it was written under.
+  - Numbered steps stay with their parent section, because they are one procedure. If that chunk is too large to embed, the steps are split and the parent heading is copied onto each one.
+- Every answer goes through an in-context gate, an initial generation, and a second decision that drops the answer unless the cited chunks can produce it. This process is optimized with parallel execution of LLM calls.
 - Every document lookup requires at max two Pinecone calls: an initial call which grabs documents semantically related to the question, and a second search which pulls spec sheets for any product mentioned in the results of the first search.
 
 Still, the system is also designed to be robust from a user perspective. A user is not required to explicitly state they are asking about Meridian documents; all questions are interpreted as being Meridian-product specific, and the corpus is assumed to be catalog-complete, both of which contribute to further reducing the chance of errors or hallucinations from attempting to reason about imagined products.
@@ -90,7 +91,7 @@ The project also has an evaluation script for end-to-end testing of the AI-enabl
 uv run mka eval
 ```
 
-`mka eval` will compute a score (0-100) for every question in `corpus/questions.json`. You also will see an overall score (the mean). Each case is scored from independent checks: expected sources cited (minus documents that role cannot see), must-contain strings present, and must-not-contain strings absent.
+`mka eval` runs every question in `corpus/questions.json` for both roles. The chat model grades each answer from 0 to 100 against that question's expected answer summary, expected sources, and grading notes. The overall score is the mean.
 
 You can also run evaluations with stat tracing to monitor costs. To do this, run:
 

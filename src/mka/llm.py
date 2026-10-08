@@ -14,15 +14,42 @@ EMBED_BATCH = 64
 class Chat(Protocol):
     def complete(self, *, system: str, user: str, json_object: bool = False) -> str: ...
 
+    def classify(self, text: str, *, instructions: str, choices: list[dict]) -> str: ...
+
 
 class Embeddings(Protocol):
     def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
 class OpenAIChat:
-    def __init__(self, client: OpenAI, model: str) -> None:
+    def __init__(self, client: OpenAI, model: str, decision_model: str = "gpt-6-luna") -> None:
         self._client = client
         self._model = model
+        self._decision_model = decision_model
+
+    def classify(self, text: str, *, instructions: str, choices: list[dict]) -> str:
+        """Fixed-choice scope label. A refusal or unusable answer is DENY.
+
+        An API error is left to raise. That is an outage, not a verdict.
+        """
+        started = time.perf_counter()
+        response = None
+        try:
+            response = self._client.decisions.create(
+                model=self._decision_model,
+                input=text,
+                questions=[
+                    {
+                        "type": "choice",
+                        "name": "scope",
+                        "instructions": instructions,
+                        "choices": choices,
+                    }
+                ],
+            )
+            return _decision_choice(response)
+        finally:
+            usage.record_decision(self._decision_model, response, usage.elapsed_ms(started))
 
     def complete(self, *, system: str, user: str, json_object: bool = False) -> str:
         kwargs: dict = {}
@@ -73,7 +100,19 @@ class OpenAIEmbeddings:
 
 def make_chat(cfg: Config) -> Chat:
     _require_openai(cfg)
-    return OpenAIChat(OpenAI(), cfg.chat_model)
+    return OpenAIChat(OpenAI(), cfg.chat_model, cfg.decision_model)
+
+
+def _decision_choice(response: object) -> str:
+    answers = getattr(response, "answers", None)
+    if not answers:
+        return "DENY"
+    answer = answers[0]
+    if getattr(answer, "type", None) != "choice":
+        return "DENY"
+    choice = getattr(answer, "choice", None)
+    value = getattr(choice, "value", choice)
+    return "" if value is None else str(value)
 
 
 def make_embeddings(cfg: Config) -> Embeddings:

@@ -60,8 +60,8 @@ def load_catalog(path: Path) -> Catalog:
     return Catalog(families, components, universal)
 
 
-# Loaded once at import: ask.py bakes scope_glossary() into its system prompt,
-# so the catalog must not change under a running process.
+# Loaded once at import: ask.py bakes scope_glossary() into the classifier
+# instructions, so the catalog must not change under a running process.
 _CATALOG = load_catalog(CATALOG_PATH)
 FAMILIES = _CATALOG.families
 COMPONENTS = _CATALOG.components
@@ -181,13 +181,13 @@ def catalog_hint(query: str) -> str:
     labels = ", ".join(f"{term} → {family}" for term, family in matched)
     return (
         f"{query}\n\n"
-        f"Catalog terms in this query (treat as Meridian products): {labels}"
+        f"Catalog terms in this query (treat as documented products): {labels}"
     )
 
 
 def scope_glossary() -> str:
     lines = [
-        "These words refer to our products even if the user does not say Meridian or a model number:"
+        "These words refer to our products even if the user does not use a catalog name:"
     ]
     for family in FAMILIES:
         models = f" ({', '.join(family.models)})" if family.models else ""

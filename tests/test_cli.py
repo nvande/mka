@@ -121,6 +121,10 @@ def test_ask_empty_via_cli(capsys: object) -> None:
 
 def test_ask_redirect_via_cli(monkeypatch: pytest.MonkeyPatch, capsys: object) -> None:
     class DenyChat:
+        def classify(self, text: str, *, instructions: str, choices: list[dict]) -> str:
+            del text, instructions, choices
+            return "DENY"
+
         def complete(self, *, system: str, user: str) -> str:
             del system, user
             return "DENY"
@@ -136,6 +140,10 @@ def test_ask_redirect_via_cli(monkeypatch: pytest.MonkeyPatch, capsys: object) -
 
 def test_ask_subjective_via_cli(monkeypatch: pytest.MonkeyPatch, capsys: object) -> None:
     class SubjectiveChat:
+        def classify(self, text: str, *, instructions: str, choices: list[dict]) -> str:
+            del text, instructions, choices
+            return "SUBJECTIVE"
+
         def complete(self, *, system: str, user: str) -> str:
             del system, user
             return "SUBJECTIVE"
